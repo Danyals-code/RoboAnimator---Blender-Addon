@@ -1,7 +1,7 @@
 bl_info = {
     "name": "True RoboAnimator",
     "author": "Danyal S.",
-    "version": (1, 0, 0),
+    "version": (1, 0, 1),
     "blender": (4, 2, 0),
     "location": "3D Viewport > N-Panel > True RoboAnimator",
     "description": "Engineering-accurate animation toolkit for differential-drive robots.",
