@@ -18,18 +18,18 @@ def _section(layout, P, flag_name: str, title: str):
     """
     box = layout.box()
     header = box.row()
-    header.use_property_split = False  # critical: make the header clickable
+    header.use_property_split = False
+    header.use_property_decorate = False
 
     if hasattr(P, flag_name):
-        is_open = getattr(P, flag_name)
+        is_open = bool(getattr(P, flag_name))
         icon = 'TRIA_DOWN' if is_open else 'TRIA_RIGHT'
-        # Draw the *flag property itself* as the header so clicking toggles it
         header.prop(P, flag_name, text=title, icon=icon, emboss=False)
-        return box if is_open else None
+        return box.column(align=True) if is_open else None
 
     # Fallback: no flag on SG_Props → always-open box (no dropdown)
     header.label(text=title)
-    return box
+    return box.column(align=True)
 
 
 # ---------- main panel ----------
@@ -52,26 +52,25 @@ class SG_PT_Panel(Panel):
         # --- Instructions ---
         box = _section(layout, P, "show_instructions", "Instructions")
         if box:
-            c = box.column(align=True)
-            c.label(text="1) Animate chassis (location + rotation).")
-            c.label(text="2) Validate Motion (no sideways slip).")
-            c.label(text="3) Autocorrect: S-Curve or Linear.")
-            c.label(text="4) Pick Speed Profile.")
-            c.label(text="5) Build Cache → Attach Drivers (or Bake).")
-            c.label(text="6) Export (keyframes / CSV).")
-            c.label(text="Tip: If wheels roll backwards, toggle Wheel Forward Invert or swap L/R.")
+            box.label(text="1) Animate chassis (location + rotation).")
+            box.label(text="2) Validate Motion (no sideways slip).")
+            box.label(text="3) Autocorrect: S-Curve or Linear.")
+            box.label(text="4) Pick Speed Profile.")
+            box.label(text="5) Build Cache → Attach Drivers (or Bake).")
+            box.label(text="6) Export (keyframes / CSV).")
+            box.label(text="Tip: If wheels roll backwards, toggle Wheel Forward Invert or swap L/R.")
 
-        # --- Object Selection + Calibration (merged) ---
-        box = _section(layout, P, "show_selection", "Object Selection & Calibration")
-        if box:
-            col = box.column(align=True)
-            # Selection
+        # --- Object Selection ---
+        col = _section(layout, P, "show_selection", "Object Selection")
+        if col:
             _maybe_prop(col, P, "chassis")
             _maybe_prop(col, P, "right_collection")
             _maybe_prop(col, P, "left_collection")
             _maybe_prop(col, P, "swap_lr")
 
-            col.separator()
+        # --- Calibration & Wheel Setup ---
+        col = _section(layout, P, "show_calibration", "Calibration & Wheel Setup")
+        if col:
             col.label(text="Geometry (meters)")
             _maybe_prop(col, P, "track_width")
             _maybe_prop(col, P, "tire_spacing")
@@ -88,9 +87,8 @@ class SG_PT_Panel(Panel):
             _maybe_prop(col, P, "wheel_forward_invert")
 
         # --- Feasibility & Autocorrect ---
-        box = _section(layout, P, "show_feasibility", "Feasibility & Autocorrect")
-        if box:
-            col = box.column(align=True)
+        col = _section(layout, P, "show_feasibility", "Feasibility & Autocorrect")
+        if col:
             _maybe_prop(col, P, "body_forward_axis")
             _maybe_prop(col, P, "side_tol")
             _maybe_prop(col, P, "autocorrect_mode")
@@ -121,33 +119,31 @@ class SG_PT_Panel(Panel):
             col.operator("segway.revert_autocorrect", icon='LOOP_BACK')
 
         # --- RPM Calculation & Limits ---
-        box = _section(layout, P, "show_rpm_calc", "RPM Calculation & Limits")
-        if box:
-            lim = box.box().column(align=True)
+        col = _section(layout, P, "show_rpm_calc", "RPM Calculation & Limits")
+        if col:
+            lim = col.box().column(align=True)
             _maybe_prop(lim, P, "max_rpm")
             _maybe_prop(lim, P, "max_ang_accel_rpm_s")
 
-            r = box.row(align=True)
+            r = col.row(align=True)
             r.operator("segway.build_cache", icon='CHECKMARK')
             r.operator("segway.attach_drivers", icon='DRIVER')
 
-            r2 = box.row(align=True)
+            r2 = col.row(align=True)
             r2.operator("segway.bake_wheels", icon='REC')
             r2.operator("segway.clear", icon='X')
 
         # --- Animation Data Export (Keyframes) ---
-        box = _section(layout, P, "show_anim_export", "Animation Data Export (Keyframes)")
-        if box:
-            col = box.column(align=True)
+        col = _section(layout, P, "show_anim_export", "Animation Data Export (Keyframes)")
+        if col:
             _maybe_prop(col, P, "other_export_path")
             _maybe_prop(col, P, "other_export_format")
             _maybe_prop(col, P, "other_angle_unit")
             col.operator("segway.export_keyframes", icon='EXPORT')
 
         # --- CSV Engineering Export ---
-        box = _section(layout, P, "show_csv_export", "CSV Engineering Export")
-        if box:
-            col = box.column(align=True)
+        col = _section(layout, P, "show_csv_export", "CSV Engineering Export")
+        if col:
             _maybe_prop(col, P, "csv_path")
             _maybe_prop(col, P, "sample_mode")
             if getattr(P, "sample_mode", "") == 'FIXED':
