@@ -11,26 +11,24 @@ def _maybe_prop(col, P, name, **kw):
         except Exception:
             pass
 
-def _section(layout, P, flag_name: str, title: str):
+def foldout(layout, P, flag_name: str, title: str):
     """
     Collapsible section controlled by Scene.sg_props.<flag_name>.
-    If the flag doesn't exist, render an always-open box.
+    Returns a column to draw into when open, else None.
     """
     box = layout.box()
     header = box.row()
-    header.use_property_split = False
+    header.use_property_split = False   # critical: make header clickable
     header.use_property_decorate = False
-
     if hasattr(P, flag_name):
         is_open = bool(getattr(P, flag_name))
         icon = 'TRIA_DOWN' if is_open else 'TRIA_RIGHT'
+        # Draw the actual BoolProperty in the header — clicking toggles it
         header.prop(P, flag_name, text=title, icon=icon, emboss=False)
         return box.column(align=True) if is_open else None
-
-    # Fallback: no flag on SG_Props → always-open box (no dropdown)
+    # Fallback if the flag is missing → always open
     header.label(text=title)
     return box.column(align=True)
-
 
 # ---------- main panel ----------
 class SG_PT_Panel(Panel):
@@ -50,27 +48,26 @@ class SG_PT_Panel(Panel):
         layout.use_property_decorate = False
 
         # --- Instructions ---
-        box = _section(layout, P, "show_instructions", "Instructions")
-        if box:
-            box.label(text="1) Animate chassis (location + rotation).")
-            box.label(text="2) Validate Motion (no sideways slip).")
-            box.label(text="3) Autocorrect: S-Curve or Linear.")
-            box.label(text="4) Pick Speed Profile.")
-            box.label(text="5) Build Cache → Attach Drivers (or Bake).")
-            box.label(text="6) Export (keyframes / CSV).")
-            box.label(text="Tip: If wheels roll backwards, toggle Wheel Forward Invert or swap L/R.")
-
-        # --- Object Selection ---
-        col = _section(layout, P, "show_selection", "Object Selection")
+        col = foldout(layout, P, "show_instructions", "Instructions")
         if col:
+            col.label(text="1) Animate chassis (location + rotation).")
+            col.label(text="2) Validate Motion (no sideways slip).")
+            col.label(text="3) Autocorrect: S-Curve or Linear.")
+            col.label(text="4) Pick Speed Profile.")
+            col.label(text="5) Build Cache → Attach Drivers (or Bake).")
+            col.label(text="6) Export (keyframes / CSV).")
+            col.label(text="Tip: If wheels roll backwards, toggle Wheel Forward Invert or swap L/R.")
+
+        # --- Object Selection & Calibration (merged) ---
+        col = foldout(layout, P, "show_selection", "Object Selection & Calibration")
+        if col:
+            # Selection
             _maybe_prop(col, P, "chassis")
             _maybe_prop(col, P, "right_collection")
             _maybe_prop(col, P, "left_collection")
             _maybe_prop(col, P, "swap_lr")
 
-        # --- Calibration & Wheel Setup ---
-        col = _section(layout, P, "show_calibration", "Calibration & Wheel Setup")
-        if col:
+            col.separator()
             col.label(text="Geometry (meters)")
             _maybe_prop(col, P, "track_width")
             _maybe_prop(col, P, "tire_spacing")
@@ -87,7 +84,7 @@ class SG_PT_Panel(Panel):
             _maybe_prop(col, P, "wheel_forward_invert")
 
         # --- Feasibility & Autocorrect ---
-        col = _section(layout, P, "show_feasibility", "Feasibility & Autocorrect")
+        col = foldout(layout, P, "show_feasibility", "Feasibility & Autocorrect")
         if col:
             _maybe_prop(col, P, "body_forward_axis")
             _maybe_prop(col, P, "side_tol")
@@ -119,7 +116,7 @@ class SG_PT_Panel(Panel):
             col.operator("segway.revert_autocorrect", icon='LOOP_BACK')
 
         # --- RPM Calculation & Limits ---
-        col = _section(layout, P, "show_rpm_calc", "RPM Calculation & Limits")
+        col = foldout(layout, P, "show_rpm_calc", "RPM Calculation & Limits")
         if col:
             lim = col.box().column(align=True)
             _maybe_prop(lim, P, "max_rpm")
@@ -134,7 +131,7 @@ class SG_PT_Panel(Panel):
             r2.operator("segway.clear", icon='X')
 
         # --- Animation Data Export (Keyframes) ---
-        col = _section(layout, P, "show_anim_export", "Animation Data Export (Keyframes)")
+        col = foldout(layout, P, "show_anim_export", "Animation Data Export (Keyframes)")
         if col:
             _maybe_prop(col, P, "other_export_path")
             _maybe_prop(col, P, "other_export_format")
@@ -142,7 +139,7 @@ class SG_PT_Panel(Panel):
             col.operator("segway.export_keyframes", icon='EXPORT')
 
         # --- CSV Engineering Export ---
-        col = _section(layout, P, "show_csv_export", "CSV Engineering Export")
+        col = foldout(layout, P, "show_csv_export", "CSV Engineering Export")
         if col:
             _maybe_prop(col, P, "csv_path")
             _maybe_prop(col, P, "sample_mode")
