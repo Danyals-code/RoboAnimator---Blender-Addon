@@ -13,20 +13,24 @@ def _maybe_prop(col, P, name, **kw):
 
 def _section(layout, P, flag_name: str, title: str):
     """
-    Collapsible section controlled by a Scene.sg_props boolean like 'show_xxx'.
-    If the flag doesn't exist, we render an always-open box.
+    Collapsible section controlled by Scene.sg_props.<flag_name>.
+    If the flag doesn't exist, render an always-open box.
     """
     box = layout.box()
     header = box.row()
+    header.use_property_split = False  # critical: make the header clickable
+
     if hasattr(P, flag_name):
         is_open = getattr(P, flag_name)
         icon = 'TRIA_DOWN' if is_open else 'TRIA_RIGHT'
-        header.prop(P, flag_name, text="", icon=icon, emboss=False)
-        header.label(text=title)
+        # Draw the *flag property itself* as the header so clicking toggles it
+        header.prop(P, flag_name, text=title, icon=icon, emboss=False)
         return box if is_open else None
-    # no flag on props -> just always open
+
+    # Fallback: no flag on SG_Props → always-open box (no dropdown)
     header.label(text=title)
     return box
+
 
 # ---------- main panel ----------
 class SG_PT_Panel(Panel):
