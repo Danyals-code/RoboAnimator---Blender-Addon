@@ -138,7 +138,6 @@ class SG_OT_ImportCSVAnim(bpy.types.Operator, ImportHelper):
 
         # Clear existing curves on the paths we touch (location.*, rotation_euler.z)
         action = obj.animation_data.action
-        # Collect and remove to avoid modifying while iterating
         to_remove = [fc for fc in action.fcurves if fc.data_path in ("location", "rotation_euler")]
         for fc in to_remove:
             action.fcurves.remove(fc)
@@ -151,7 +150,7 @@ class SG_OT_ImportCSVAnim(bpy.types.Operator, ImportHelper):
                 x = float(r[ci_x]) * length_scale
                 y = float(r[ci_y]) * length_scale
                 if ci_yaw_r >= 0:
-                    yaw = float(r[ci_yaw_r])  # already radians
+                    yaw = float(r[ci_yaw_r])  # radians
                 else:
                     yaw = math.radians(float(r[ci_yaw_d]))
 
@@ -187,25 +186,8 @@ class SG_OT_ImportCSVAnim(bpy.types.Operator, ImportHelper):
         return {'FINISHED'}
 
 
-# ---------- mini panel (N-panel) ----------
-class SG_PT_ImportAnim(bpy.types.Panel):
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = 'True RoboAnimator'
-    bl_label = "Import Animation"
-    bl_options = {'DEFAULT_CLOSED'}
-
-    def draw(self, context):
-        layout = self.layout
-        col = layout.column(align=True)
-        col.operator(SG_OT_ImportCSVAnim.bl_idname, icon='IMPORT')
-
-
 # ---------- register ----------
-CLASSES = (
-    SG_OT_ImportCSVAnim,
-    SG_PT_ImportAnim,
-)
+CLASSES = (SG_OT_ImportCSVAnim,)
 
 def register():
     from bpy.utils import register_class
