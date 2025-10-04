@@ -94,6 +94,21 @@ class SG_PT_Panel(Panel):
             _maybe_prop(col, P, "sign_l")
             _maybe_prop(col, P, "wheel_forward_invert")
 
+        # ---------------- Import Animation ----------------
+        box = layout.box()
+        row = box.row(align=True)
+        row.label(text="Import Animation", icon='ANIM')
+
+        col = box.column(align=True)
+        col.operator("segway.import_csv_anim", icon='IMPORT')
+
+        # If the active object has an attached CSV, show its Text name for provenance
+        obj = context.object
+        if obj and isinstance(getattr(obj, "get", None), type(dict.get)) and 'roboanim_csv_text' in obj:
+            col.separator()
+            col.label(text=f"Attached CSV: {obj['roboanim_csv_text']}", icon='TEXT')
+
+
         # ---------------- Feasibility & Autocorrect ----------------
         col = self._section(layout, "show_feasibility", "Feasibility & Autocorrect")
         if col:
