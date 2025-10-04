@@ -1,4 +1,4 @@
-# ops_ui.py — N-panel UI for True RoboAnimator (native panels + subpanels)
+# ops_ui.py — Final refined UI with subtle spacing for readability
 import bpy
 from bpy.types import Panel
 
@@ -13,210 +13,190 @@ def _maybe_prop(col, P, name, **kw):
         except Exception:
             pass
 
-# ---------- MAIN PANEL (collapsible) ----------
-class SG_PT_Main(Panel):
+def _pick_flag(P, candidates, fallback_name=None, fallback_default=True):
+    for n in candidates:
+        if hasattr(P, n):
+            return n, bool(getattr(P, n))
+    if fallback_name and hasattr(P, fallback_name):
+        return fallback_name, bool(getattr(P, fallback_name))
+    return None, fallback_default
+
+# ---------- main panel ----------
+class SG_PT_Panel(Panel):
     bl_label = "True RoboAnimator"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = "True RoboAnimator"
-    # Start closed so the whole block is collapsible like native Blender sections.
-    bl_options = {'DEFAULT_CLOSED'}
+
+    def _section(self, layout, prop_flag: str, title: str):
+        box = layout.box()
+        header = box.row()
+        P = bpy.context.scene.sg_props
+        is_open = bool(getattr(P, prop_flag, False))
+        icon = 'TRIA_DOWN' if is_open else 'TRIA_RIGHT'
+        header.prop(P, prop_flag, text="", icon=icon, emboss=False)
+        header.label(text=title)
+        if not is_open:
+            return None
+        # add inner margin wrapper
+        margin = box.column(align=False)
+        margin.separator(factor=0.3)
+        inner = margin.column(align=True)
+        inner.use_property_split = True
+        inner.use_property_decorate = False
+        return inner
 
     def draw(self, context):
-        # Intentionally minimal: subpanels contain all content.
-        if _P(context) is None:
-            self.layout.label(text="SG_Props not registered. Enable the add-on.", icon='ERROR')
-
-# ---------- SUBPANELS ----------
-class SG_PT_Instructions(Panel):
-    bl_label = "Instructions"
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = "True RoboAnimator"
-    bl_parent_id = "SG_PT_Main"
-    bl_options = {'DEFAULT_CLOSED'}
-
-    def draw(self, context):
-        col = self.layout.column(align=True)
-        col.label(text="1) Animate chassis (location + rotation).")
-        col.label(text="2) Validate Motion (no sideways slip).")
-        col.label(text="3) Autocorrect: S-Curve or Linear.")
-        col.label(text="4) Pick Speed Profile.")
-        col.label(text="5) Build Cache → Attach Drivers (or Bake).")
-        col.label(text="6) Export (Raw / Engineering CSV).")
-        col.label(text="Tip: If wheels roll backwards, toggle Wheel Forward Invert or swap L/R.")
-
-class SG_PT_SelectionCalib(Panel):
-    bl_label = "Object Selection & Calibration"
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = "True RoboAnimator"
-    bl_parent_id = "SG_PT_Main"
-    bl_options = {'DEFAULT_CLOSED'}
-
-    def draw(self, context):
-        P = _P(context);
-        if not P: return
-        col = self.layout.column(align=True)
-
-        # Selection
-        _maybe_prop(col, P, "chassis")
-        _maybe_prop(col, P, "right_collection")
-        _maybe_prop(col, P, "left_collection")
-        _maybe_prop(col, P, "swap_lr")
-
-        col.separator()
-        col.label(text="Geometry (meters)")
-        _maybe_prop(col, P, "track_width")
-        _maybe_prop(col, P, "tire_spacing")
-        _maybe_prop(col, P, "auto_radius")
-        if getattr(P, "auto_radius", False) is False:
-            _maybe_prop(col, P, "wheel_radius")
-
-        col.separator()
-        col.label(text="Wheel Rotation")
-        _maybe_prop(col, P, "wheel_axis")
-        _maybe_prop(col, P, "rotation_mode")
-        _maybe_prop(col, P, "sign_r")
-        _maybe_prop(col, P, "sign_l")
-        _maybe_prop(col, P, "wheel_forward_invert")
-
-class SG_PT_Feasibility(Panel):
-    bl_label = "Feasibility & Autocorrect"
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = "True RoboAnimator"
-    bl_parent_id = "SG_PT_Main"
-    bl_options = {'DEFAULT_CLOSED'}
-
-    def draw(self, context):
-        P = _P(context);
-        if not P: return
-        col = self.layout.column(align=True)
-
-        _maybe_prop(col, P, "body_forward_axis")
-        _maybe_prop(col, P, "side_tol")
-        _maybe_prop(col, P, "autocorrect_mode")
-
-        row_se = col.row(align=True); row_se.enabled = getattr(P, "autocorrect_mode", "") == 'SEASE'
-        _maybe_prop(row_se, P, "bezier_tangent_scale")
-
-        row_lin = col.row(align=True); row_lin.enabled = getattr(P, "autocorrect_mode", "") == 'LINEAR'
-        _maybe_prop(row_lin, P, "linear_rotation_fraction")
-
-        col.separator()
-        _maybe_prop(col, P, "speed_profile")
-
-        row_const = col.row(align=True); row_const.enabled = getattr(P, "speed_profile", "") == 'CONSTANT'
-        _maybe_prop(row_const, P, "constant_ramp_frames")
-
-        row_tl = col.row(align=True); row_tl.enabled = getattr(P, "speed_profile", "") == 'GLOBAL_EASE'
-        _maybe_prop(row_tl, P, "timeline_ease_frames")
-
-        row_seg = col.row(align=True); row_seg.enabled = getattr(P, "speed_profile", "") == 'PER_KEY_EASE'
-        _maybe_prop(row_seg, P, "segment_ease_frames")
-
-        col.separator()
-        r = col.row(align=True)
-        r.operator("segway.validate_motion", icon='INFO')
-        r.operator("segway.autocorrect_bake", icon='MOD_CURVE')
-        col.operator("segway.revert_autocorrect", icon='LOOP_BACK')
-
-class SG_PT_RPM(Panel):
-    bl_label = "RPM Calculation & Limits"
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = "True RoboAnimator"
-    bl_parent_id = "SG_PT_Main"
-    bl_options = {'DEFAULT_CLOSED'}
-
-    def draw(self, context):
-        P = _P(context);
-        if not P: return
-        col = self.layout.column(align=True)
-
-        lim = col.box().column(align=True)
-        _maybe_prop(lim, P, "max_rpm")
-        _maybe_prop(lim, P, "max_ang_accel_rpm_s")
-
-        r = col.row(align=True)
-        r.operator("segway.build_cache", icon='CHECKMARK')
-        r.operator("segway.attach_drivers", icon='DRIVER')
-
-        r2 = col.row(align=True)
-        r2.operator("segway.bake_wheels", icon='REC')
-        r2.operator("segway.clear", icon='X')
-
-# ---------- EXPORT PANEL + SUBPANELS ----------
-class SG_PT_Export(Panel):
-    bl_label = "Export CSV"
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = "True RoboAnimator"
-    bl_parent_id = "SG_PT_Main"
-    bl_options = {'DEFAULT_CLOSED'}
-
-    def draw(self, context):
-        # Header only; content is in subpanels.
-        pass
-
-class SG_PT_Export_Raw(Panel):
-    bl_label = "Raw animation data"
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = "True RoboAnimator"
-    bl_parent_id = "SG_PT_Export"
-    bl_options = {'DEFAULT_CLOSED'}
-
-    def draw(self, context):
-        P = _P(context);
-        if not P: return
-        col = self.layout.column(align=True)
-        _maybe_prop(col, P, "other_export_path")
-        _maybe_prop(col, P, "other_export_format")  # CSV or JSON
-        _maybe_prop(col, P, "other_angle_unit")     # RAD / DEG
-        col.operator("segway.export_keyframes", icon='EXPORT')
-
-class SG_PT_Export_Eng(Panel):
-    bl_label = "Engineering data"
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = "True RoboAnimator"
-    bl_parent_id = "SG_PT_Export"
-    bl_options = {'DEFAULT_CLOSED'}
-
-    def draw(self, context):
-        P = _P(context)
-        if not P: return
-
         layout = self.layout
-        col = layout.column(align=True)
-        col.scale_x = 0.95
+        P = _P(context)
+        if not P:
+            layout.label(text="SG_Props not registered.", icon='ERROR')
+            return
 
-        box = col.box()
-        inner = box.column(align=True)
+        layout.use_property_split = True
+        layout.use_property_decorate = False
 
-        _maybe_prop(inner, P, "csv_path")
-        _maybe_prop(inner, P, "sample_mode")
-        if getattr(P, "sample_mode", "") == 'FIXED':
-            _maybe_prop(inner, P, "fixed_rate")
-        _maybe_prop(inner, P, "angle_unit")
-        _maybe_prop(inner, P, "angrate_unit")
-        _maybe_prop(inner, P, "length_unit")
+        # ---------------- Instructions ----------------
+        col = self._section(layout, "show_instructions", "Instructions")
+        if col:
+            c = col.column(align=True)
+            c.label(text="1) Animate chassis (location + rotation).")
+            c.label(text="2) Validate Motion (no sideways slip).")
+            c.label(text="3) Autocorrect: S-Curve or Linear.")
+            c.label(text="4) Pick Speed Profile.")
+            c.label(text="5) Build Cache → Attach Drivers or Bake.")
+            c.label(text="6) Export (Raw / Engineering CSV).")
 
-        inner.operator("segway.export_csv", icon='EXPORT')
+        # ---------------- Selection + Calibration ----------------
+        col = self._section(layout, "show_selection", "Object Selection & Calibration")
+        if col:
+            # Selection group
+            _maybe_prop(col, P, "chassis")
+            _maybe_prop(col, P, "right_collection")
+            _maybe_prop(col, P, "left_collection")
+            _maybe_prop(col, P, "swap_lr")
+
+            col.separator(factor=2.0)  # <--- extra space between selection and calibration
+
+            # Calibration / geometry
+            _maybe_prop(col, P, "track_width")
+            _maybe_prop(col, P, "tire_spacing")
+            _maybe_prop(col, P, "auto_radius")
+            if not getattr(P, "auto_radius", True):
+                _maybe_prop(col, P, "wheel_radius")
+
+            col.separator(factor=2.0)  # <--- extra space before wheel setup
+
+            # Wheel setup
+            _maybe_prop(col, P, "wheel_axis")
+            _maybe_prop(col, P, "rotation_mode")
+            _maybe_prop(col, P, "sign_r")
+            _maybe_prop(col, P, "sign_l")
+            _maybe_prop(col, P, "wheel_forward_invert")
+
+        # ---------------- Feasibility & Autocorrect ----------------
+        col = self._section(layout, "show_feasibility", "Feasibility & Autocorrect")
+        if col:
+            # Autocorrect settings
+            _maybe_prop(col, P, "body_forward_axis")
+            _maybe_prop(col, P, "side_tol")
+            _maybe_prop(col, P, "autocorrect_mode")
+
+            row_se = col.row(align=True)
+            row_se.enabled = getattr(P, "autocorrect_mode", "") == 'SEASE'
+            _maybe_prop(row_se, P, "bezier_tangent_scale")
+
+            row_lin = col.row(align=True)
+            row_lin.enabled = getattr(P, "autocorrect_mode", "") == 'LINEAR'
+            _maybe_prop(row_lin, P, "linear_rotation_fraction")
+
+            col.separator(factor=2.0)  # <--- space between autocorrect and speed profile
+
+            # Speed profile
+            _maybe_prop(col, P, "speed_profile")
+
+            row_const = col.row(align=True)
+            row_const.enabled = getattr(P, "speed_profile", "") == 'CONSTANT'
+            _maybe_prop(row_const, P, "constant_ramp_frames")
+
+            row_tl = col.row(align=True)
+            row_tl.enabled = getattr(P, "speed_profile", "") == 'GLOBAL_EASE'
+            _maybe_prop(row_tl, P, "timeline_ease_frames")
+
+            row_seg = col.row(align=True)
+            row_seg.enabled = getattr(P, "speed_profile", "") == 'PER_KEY_EASE'
+            _maybe_prop(row_seg, P, "segment_ease_frames")
+
+            col.separator(factor=2.0)  # <--- space before buttons
+
+            # Operators
+            r = col.row(align=True)
+            r.operator("segway.validate_motion", icon='INFO')
+            r.operator("segway.autocorrect_bake", icon='MOD_CURVE')
+            col.operator("segway.revert_autocorrect", icon='LOOP_BACK')
+
+        # ---------------- RPM Calculation & Limits ----------------
+        col = self._section(layout, "show_rpm_calc", "RPM Calculation & Limits")
+        if col:
+            _maybe_prop(col, P, "max_rpm")
+            _maybe_prop(col, P, "max_ang_accel_rpm_s")
+            col.separator()
+            r1 = col.row(align=True)
+            r1.operator("segway.build_cache", icon='CHECKMARK')
+            r1.operator("segway.attach_drivers", icon='DRIVER')
+            r2 = col.row(align=True)
+            r2.operator("segway.bake_wheels", icon='REC')
+            r2.operator("segway.clear", icon='X')
+
+        # ---------------- Export (collapsible, two parts spaced) ----------------
+        flag_name, is_open = _pick_flag(
+            P,
+            candidates=["show_export"],
+            fallback_name=("show_csv_export" if hasattr(P, "show_csv_export") else
+                           ("show_anim_export" if hasattr(P, "show_anim_export") else None)),
+            fallback_default=True
+        )
+
+        exp_box = layout.box()
+        header = exp_box.row()
+        icon = 'TRIA_DOWN' if is_open else 'TRIA_RIGHT'
+        if flag_name:
+            header.prop(P, flag_name, text="", icon=icon, emboss=False)
+        else:
+            header.label(text="", icon=icon)
+        header.label(text="Export")
+
+        if is_open:
+            margin = exp_box.column(align=False)
+            margin.separator(factor=0.3)
+            col = margin.column(align=True)
+            col.use_property_split = True
+            col.use_property_decorate = False
+
+            # ---- Raw Animation Data ----
+            _colA = col.column(align=True)
+            _maybe_prop(_colA, P, "other_export_path")
+            _maybe_prop(_colA, P, "other_export_format")
+            _maybe_prop(_colA, P, "other_angle_unit")
+            _colA.separator(factor=0.7)
+            _colA.operator("segway.export_keyframes", text="Export Raw Animation Data", icon='EXPORT')
+
+            col.separator(factor=1.7)
+
+            # ---- Engineering CSV Data ----
+            _colB = col.column(align=True)
+            _maybe_prop(_colB, P, "csv_path")
+            _maybe_prop(_colB, P, "sample_mode")
+            if getattr(P, "sample_mode", "") == 'FIXED':
+                _maybe_prop(_colB, P, "fixed_rate")
+            _maybe_prop(_colB, P, "angle_unit")
+            _maybe_prop(_colB, P, "angrate_unit")
+            _maybe_prop(_colB, P, "length_unit")
+            _colB.separator(factor=0.7)
+            _colB.operator("segway.export_csv", text="Export Engineering Requirements", icon='EXPORT')
 
 # ---------- registration ----------
-classes = (
-    SG_PT_Main,
-    SG_PT_Instructions,
-    SG_PT_SelectionCalib,
-    SG_PT_Feasibility,
-    SG_PT_RPM,
-    SG_PT_Export,
-    SG_PT_Export_Raw,
-    SG_PT_Export_Eng,
-)
+classes = (SG_PT_Panel,)
 
 def register():
     from bpy.utils import register_class
