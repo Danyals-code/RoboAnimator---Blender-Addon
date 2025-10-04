@@ -186,17 +186,25 @@ class SG_PT_Export_Eng(Panel):
     bl_options = {'DEFAULT_CLOSED'}
 
     def draw(self, context):
-        P = _P(context);
+        P = _P(context)
         if not P: return
-        col = self.layout.column(align=True)
-        _maybe_prop(col, P, "csv_path")
-        _maybe_prop(col, P, "sample_mode")          # FRAME / FIXED
+
+        layout = self.layout
+        col = layout.column(align=True)
+        col.scale_x = 0.95
+
+        box = col.box()
+        inner = box.column(align=True)
+
+        _maybe_prop(inner, P, "csv_path")
+        _maybe_prop(inner, P, "sample_mode")
         if getattr(P, "sample_mode", "") == 'FIXED':
-            _maybe_prop(col, P, "fixed_rate")
-        _maybe_prop(col, P, "angle_unit")           # RAD / DEG
-        _maybe_prop(col, P, "angrate_unit")         # RPM / RPS / DEGS
-        _maybe_prop(col, P, "length_unit")          # M / CM
-        col.operator("segway.export_csv", icon='EXPORT')
+            _maybe_prop(inner, P, "fixed_rate")
+        _maybe_prop(inner, P, "angle_unit")
+        _maybe_prop(inner, P, "angrate_unit")
+        _maybe_prop(inner, P, "length_unit")
+
+        inner.operator("segway.export_csv", icon='EXPORT')
 
 # ---------- registration ----------
 classes = (
