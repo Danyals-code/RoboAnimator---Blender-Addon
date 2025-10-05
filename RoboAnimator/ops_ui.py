@@ -71,9 +71,28 @@ class SG_PT_Panel(Panel):
         if col:
             # Selection
             _maybe_prop(col, P, "chassis")
-            _maybe_prop(col, P, "right_collection")
+            # system selector
+            _maybe_prop(col, P, "wheel_system")
+
+            # 2W vs 4W UI
+            if getattr(P, "wheel_system", "2W") == "2W":
+                _maybe_prop(col, P, "wheel_left")
+                _maybe_prop(col, P, "wheel_right")
+            else:
+                row = col.row(align=True);
+                row.label(text="Left")
+                _maybe_prop(col, P, "wheel_fl");
+                _maybe_prop(col, P, "wheel_rl")
+                row = col.row(align=True);
+                row.label(text="Right")
+                _maybe_prop(col, P, "wheel_fr");
+                _maybe_prop(col, P, "wheel_rr")
+
+            # keep legacy bits visible but clearly “legacy/fallback”
+            col.separator()
+            col.label(text="Legacy (collections, optional):", icon='INFO')
             _maybe_prop(col, P, "left_collection")
-            _maybe_prop(col, P, "swap_lr")
+            _maybe_prop(col, P, "right_collection")
 
             col.separator(factor=2.0)  # spacing
 

@@ -236,6 +236,36 @@ def _obj_rest_quat(obj):
     n=sqrt(q[0]*q[0]+q[1]*q[1]+q[2]*q[2]+q[3]*q[3]) or 1.0
     return (q[0]/n, q[1]/n, q[2]/n, q[3]/n)
 
+# ---------------------- wheel selector ----------------------
+def _iter_wheels(P, side):
+    """Return a list of wheel objects for 'L' or 'R' using explicit pointers first, legacy collections second."""
+    wheels = []
+    sys = getattr(P, "wheel_system", "2W")
+
+    if sys == "4W":
+        names = (["wheel_fl","wheel_rl"] if side == 'L' else ["wheel_fr","wheel_rr"])
+        for n in names:
+            o = getattr(P, n, None)
+            if isinstance(o, bpy.types.Object):
+                wheels.append(o)
+    else:  # 2W
+        n = "wheel_left" if side == 'L' else "wheel_right"
+        o = getattr(P, n, None)
+        if isinstance(o, bpy.types.Object):
+            wheels.append(o)
+
+    # Legacy fallback to collections if explicit not set
+    if not wheels:
+        wheels = _iter_side(P, side)
+
+    # Dedup while preserving order
+    out, seen = [], set()
+    for o in wheels:
+        if o and o.name not in seen:
+            seen.add(o.name); out.append(o)
+    return out
+
+
 # ---------------------- public symbols ----------------------
 __all__ = [
     "_AXIS_INDEX","_DEFKEY","_BACKUP_KEY","_driver_key",
@@ -249,4 +279,5 @@ __all__ = [
     "_col_for_side","_iter_side","_body_basis_from_yaw",
     "_edge_ease_progress","_edge_ease_progress_asym",
     "_obj_rest_quat",
+    "_iter_wheels",
 ]

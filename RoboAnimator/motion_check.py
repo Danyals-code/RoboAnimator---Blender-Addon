@@ -28,6 +28,20 @@ class SG_Props(bpy.types.PropertyGroup):
         description="Right wheel object for rotation animation"
     )
 
+    # NEW: 2 or 4 wheel system
+    wheel_system: bpy.props.EnumProperty(
+        name="Wheel System",
+        items=[('2W', '2 Wheels', 'Differential (2 drive wheels)'),
+               ('4W', '4 Wheels', 'Front/Rear pairs, L/R driven')],
+        default='2W'
+    )
+
+    # NEW: explicit 4-wheel pointers
+    wheel_fl: bpy.props.PointerProperty(name="Front-Left Wheel", type=bpy.types.Object)
+    wheel_fr: bpy.props.PointerProperty(name="Front-Right Wheel", type=bpy.types.Object)
+    wheel_rl: bpy.props.PointerProperty(name="Rear-Left Wheel", type=bpy.types.Object)
+    wheel_rr: bpy.props.PointerProperty(name="Rear-Right Wheel", type=bpy.types.Object)
+
     # Existing: collections for multi-wheel setups (kept for compatibility)
     right_collection: bpy.props.PointerProperty(
         name="Right Wheels (Collection)",

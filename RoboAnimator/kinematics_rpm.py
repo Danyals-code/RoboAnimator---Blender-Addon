@@ -1,4 +1,6 @@
 # kinematics_rpm.py — motion feasibility, cache, drivers, bake/clear
+# Revised to support explicit 2W/4W wheel pointers with legacy-collection fallback
+# (No other files required to change.)
 
 import bpy
 from bpy.types import Operator
@@ -10,6 +12,68 @@ from .utils import (
     _col_for_side, _iter_side, _body_basis_from_yaw,
     _wrap, _unwrap,
 )
+
+# ───────────────────────────────
+# Local wheel resolution helpers
+# ───────────────────────────────
+
+def _resolve_wheels(P, side):
+    """
+    Return a list of wheel objects on the requested side ('L' or 'R').
+
+    Priority:
+      1) If P.wheel_system == '4W', use explicit pointers:
+         L -> wheel_fl, wheel_rl   |  R -> wheel_fr, wheel_rr
+      2) Else use explicit 2W pointers:
+         L -> wheel_left           |  R -> wheel_right
+      3) Else fall back to legacy collections via _iter_side(P, side)
+
+    This function is self-contained so we don't have to touch other files.
+    """
+    side = side.upper()
+    out = []
+
+    # 1) 4-wheel explicit
+    sys = getattr(P, "wheel_system", None)
+    if sys == '4W':
+        if side == 'L':
+            for name in ("wheel_fl", "wheel_rl"):
+                o = getattr(P, name, None)
+                if isinstance(o, bpy.types.Object):
+                    out.append(o)
+        else:
+            for name in ("wheel_fr", "wheel_rr"):
+                o = getattr(P, name, None)
+                if isinstance(o, bpy.types.Object):
+                    out.append(o)
+
+    # 2) 2-wheel explicit
+    if not out:
+        name = "wheel_left" if side == 'L' else "wheel_right"
+        o = getattr(P, name, None)
+        if isinstance(o, bpy.types.Object):
+            out.append(o)
+
+    # 3) Legacy collections (original behavior)
+    if not out:
+        for o in _iter_side(P, side):
+            out.append(o)
+
+    # Deduplicate by object name while preserving order
+    seen = set()
+    dedup = []
+    for o in out:
+        if o and o.name not in seen:
+            seen.add(o.name)
+            dedup.append(o)
+    return dedup
+
+
+def _first_wheel(P, side):
+    """Return a single representative wheel for a side, preferring explicit pointers."""
+    wheels = _resolve_wheels(P, side)
+    return wheels[0] if wheels else None
+
 
 # ---------------------- validation (no sideways slip per frame) ----------------------
 def analyze_motion(context):
@@ -76,12 +140,19 @@ def build_cache(context):
             f"(e.g., frames {a['violation_frames'][:10]})."
         )
 
-    colL = _col_for_side(P, 'L')
-    colR = _col_for_side(P, 'R')
-    wL0 = colL.objects[0] if (colL and len(colL.objects) > 0) else None
-    wR0 = colR.objects[0] if (colR and len(colR.objects) > 0) else None
-    restL = _obj_rest_quat(wL0)
-    restR = _obj_rest_quat(wR0)
+    # Prefer explicit wheels for reference; fall back to original collection-first approach
+    wL0 = _first_wheel(P, 'L')
+    wR0 = _first_wheel(P, 'R')
+
+    # If still nothing, keep legacy behavior to avoid breaking old scenes
+    if not wL0 and not wR0:
+        colL = _col_for_side(P, 'L')
+        colR = _col_for_side(P, 'R')
+        wL0 = colL.objects[0] if (colL and len(colL.objects) > 0) else None
+        wR0 = colR.objects[0] if (colR and len(colR.objects) > 0) else None
+
+    restL = _obj_rest_quat(wL0) if wL0 else (1.0, 0.0, 0.0, 0.0)
+    restR = _obj_rest_quat(wR0) if wR0 else (1.0, 0.0, 0.0, 0.0)
 
     signL = +1.0 if P.sign_l == 'PLUS' else -1.0
     signR = +1.0 if P.sign_r == 'PLUS' else -1.0
@@ -94,9 +165,10 @@ def build_cache(context):
 
     b = P.track_width
     if P.auto_radius:
+        # For auto radius, prefer any resolved wheel; fall back to legacy error
         w_ref = wL0 or wR0
         if not w_ref:
-            raise RuntimeError("Put at least one wheel object into the Right/Left collections.")
+            raise RuntimeError("Assign wheel objects (explicit or in Left/Right collections) for auto radius.")
         radius = _auto_radius(w_ref, P.wheel_axis)
     else:
         radius = P.wheel_radius
@@ -137,7 +209,7 @@ def build_cache(context):
         fwd, _lat = _body_basis_from_yaw(yaw_mid, P.body_forward_axis)
         dx = dp_x * fwd[0] + dp_y * fwd[1]
 
-        if P.wheel_forward_invert:
+        if getattr(P, "wheel_forward_invert", False):
             dx = -dx
 
         dpsi = yaw - prev_yaw
@@ -282,7 +354,7 @@ class SG_OT_AttachDrivers(Operator):
             return {'CANCELLED'}
         axis_i = _AXIS_INDEX[P.wheel_axis]
         for side in ('L', 'R'):
-            for obj in _iter_side(P, side):
+            for obj in _resolve_wheels(P, side):  # ← use new resolver
                 if P.rotation_mode == 'EULER':
                     _ensure_xyz_euler(obj)
                     try:
@@ -356,7 +428,7 @@ class SG_OT_Bake(Operator):
         for side in ('L', 'R'):
             arr = d['thetaL'] if side == 'L' else d['thetaR']
             rest = d['restL'] if side == 'L' else d['restR']
-            for obj in _iter_side(P, side):
+            for obj in _resolve_wheels(P, side):  # ← use new resolver
                 if P.rotation_mode == 'EULER':
                     _ensure_xyz_euler(obj)
                     try:
@@ -406,7 +478,7 @@ class SG_OT_Clear(Operator):
         axis_i = _AXIS_INDEX[P.wheel_axis]
         removed_any = False
         for side in ('L', 'R'):
-            for obj in _iter_side(P, side):
+            for obj in _resolve_wheels(P, side):  # ← use new resolver
                 try:
                     obj.driver_remove("rotation_euler", axis_i); removed_any = True
                 except Exception:
@@ -461,4 +533,3 @@ def unregister():
     from bpy.utils import unregister_class
     for c in reversed(classes):
         unregister_class(c)
-

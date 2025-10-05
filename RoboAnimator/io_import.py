@@ -1,10 +1,5 @@
 # io_import.py — Robust CSV importer for True RoboAnimator
-# - Skips leading comment/blank lines (handles '# ...' headers)
-# - Binds to calibrated chassis by default (Scene.sg_props.chassis)
-# - Flexible header parsing: time / ms / frames; x/y in m or cm; yaw in deg or rad
-# - Attaches CSV as Text datablock for provenance (optional)
-# - Clears previous X/Y/Yaw fcurves (optional)
-# - Keys LEFT/RIGHT wheel rotation from thetaL/thetaR (deg/rad), preserving base pose
+# (Minimal revision: support 2W/4W explicit wheels & keyframe ALL wheels per side)
 
 import bpy
 import csv
@@ -110,7 +105,7 @@ def _clear_existing_curves(obj):
         act.fcurves.remove(fc)
 
 
-# ------------- wheel helpers -------------
+# ------------- wheel helpers (reused & minimal additions) -------------
 
 def _resolve_wheels_from_props(P):
     """Return (left_obj, right_obj) from various common property names."""
@@ -131,6 +126,37 @@ def _resolve_wheels_from_props(P):
     if L and not isinstance(L, bpy.types.Object): L = None
     if R and not isinstance(R, bpy.types.Object): R = None
     return L, R
+
+def _resolve_wheel_lists(P):
+    """
+    Minimal addition:
+    - If user picked a 4-wheel system (P.wheel_system == '4W') and explicit pointers exist,
+      return [FL, RL] for left and [FR, RR] for right.
+    - Else fall back to your existing 2-wheel pointers (wheel_left/wheel_right) as single-item lists.
+    (We intentionally do NOT touch collections here.)
+    """
+    L_list, R_list = [], []
+    if not P:
+        return L_list, R_list
+
+    sys = getattr(P, "wheel_system", None)
+    if sys == '4W':
+        for n in ("wheel_fl", "wheel_rl"):
+            o = getattr(P, n, None)
+            if isinstance(o, bpy.types.Object):
+                L_list.append(o)
+        for n in ("wheel_fr", "wheel_rr"):
+            o = getattr(P, n, None)
+            if isinstance(o, bpy.types.Object):
+                R_list.append(o)
+        # If no 4W pointers are actually set, fall back to 2W below.
+        if L_list or R_list:
+            return L_list, R_list
+
+    L, R = _resolve_wheels_from_props(P)
+    if L: L_list.append(L)
+    if R: R_list.append(R)
+    return L_list, R_list
 
 def _resolve_wheel_axis_index(P):
     """
@@ -160,6 +186,10 @@ def _record_base_rot(L, R):
     baseL = tuple(L.rotation_euler) if L else None
     baseR = tuple(R.rotation_euler) if R else None
     return baseL, baseR
+
+def _record_base_rots_list(objs):
+    """Minimal helper for lists: map object name -> base Euler tuple."""
+    return {o.name: tuple(o.rotation_euler) for o in objs if o}
 
 def _apply_wheel_angle(obj, axis_idx, base_euler, theta_rad):
     """Set rotation_euler on given axis to base + theta."""
@@ -233,8 +263,8 @@ class SG_OT_ImportCSVAnim(bpy.types.Operator, ImportHelper):
             self.report({'ERROR'}, "No target. Set ‘Chassis’ in Object Selection & Calibration or select an active object.")
             return {'CANCELLED'}
 
-        # Resolve wheels (optional)
-        wheelL, wheelR = _resolve_wheels_from_props(P)
+        # Resolve wheels (updated: support 2W/4W lists)
+        wheelsL, wheelsR = _resolve_wheel_lists(P)
         spin_axis = _resolve_wheel_axis_index(P)
 
         # ---------- read CSV (skip # comments / blanks) ----------
@@ -320,11 +350,13 @@ class SG_OT_ImportCSVAnim(bpy.types.Operator, ImportHelper):
         # ---------- keyframe pass ----------
         scene = context.scene
         obj.animation_data_create()
-        if wheelL: wheelL.animation_data_create()
-        if wheelR: wheelR.animation_data_create()
+        for w in wheelsL: w.animation_data_create()
+        for w in wheelsR: w.animation_data_create()
 
         # Keep the starting wheel pose as base (so CSV angles add on top)
-        baseL, baseR = _record_base_rot(wheelL, wheelR)
+        # (Lists version: store each wheel's base by name)
+        baseL_map = _record_base_rots_list(wheelsL)
+        baseR_map = _record_base_rots_list(wheelsR)
 
         any_keys = False
 
@@ -381,9 +413,7 @@ class SG_OT_ImportCSVAnim(bpy.types.Operator, ImportHelper):
 
             # Need at least X and Y to place the chassis
             if x_m is None or y_m is None:
-                # Still allow wheel-only keying if you insist, but typical tracks need pose too.
-                # continue
-                pass
+                pass  # allow wheel-only keying if needed
 
             # Key chassis X/Y
             if x_m is not None:
@@ -400,8 +430,7 @@ class SG_OT_ImportCSVAnim(bpy.types.Operator, ImportHelper):
                 obj.rotation_euler = e
                 obj.keyframe_insert(data_path="rotation_euler", frame=f, index=2)
 
-            # ---- Wheel rotations ----
-            # Left
+            # ---- Wheel rotations (NOW: for all wheels per side) ----
             thetaL = None
             if i_thetaL_rad >= 0 and len(r) > i_thetaL_rad:
                 thetaL = _maybe_float(r[i_thetaL_rad])
@@ -409,7 +438,6 @@ class SG_OT_ImportCSVAnim(bpy.types.Operator, ImportHelper):
                 v = _maybe_float(r[i_thetaL_deg])
                 thetaL = math.radians(v) if v is not None else None
 
-            # Right
             thetaR = None
             if i_thetaR_rad >= 0 and len(r) > i_thetaR_rad:
                 thetaR = _maybe_float(r[i_thetaR_rad])
@@ -417,21 +445,23 @@ class SG_OT_ImportCSVAnim(bpy.types.Operator, ImportHelper):
                 v = _maybe_float(r[i_thetaR_deg])
                 thetaR = math.radians(v) if v is not None else None
 
-            # Apply and key wheel rotations (absolute angles + base pose)
-            if wheelL and thetaL is not None:
-                _apply_wheel_angle(wheelL, spin_axis, baseL, thetaL)
-                wheelL.keyframe_insert(data_path="rotation_euler", frame=f, index=spin_axis)
-            if wheelR and thetaR is not None:
-                _apply_wheel_angle(wheelR, spin_axis, baseR, thetaR)
-                wheelR.keyframe_insert(data_path="rotation_euler", frame=f, index=spin_axis)
+            if thetaL is not None:
+                for w in wheelsL:
+                    _apply_wheel_angle(w, spin_axis, baseL_map.get(w.name), thetaL)
+                    w.keyframe_insert(data_path="rotation_euler", frame=f, index=spin_axis)
+            if thetaR is not None:
+                for w in wheelsR:
+                    _apply_wheel_angle(w, spin_axis, baseR_map.get(w.name), thetaR)
+                    w.keyframe_insert(data_path="rotation_euler", frame=f, index=spin_axis)
 
-            any_keys = True
+            if (x_m is not None) or (y_m is not None) or (yaw_rad is not None) or (thetaL is not None) or (thetaR is not None):
+                any_keys = True
 
         if not any_keys:
             self.report({'WARNING'}, "Parsed CSV but no valid rows produced keyframes.")
             return {'CANCELLED'}
 
-        self.report({'INFO'}, f"Imported animation to '{obj.name}' (chassis + wheels).")
+        self.report({'INFO'}, f"Imported animation to '{obj.name}' (chassis + {len(wheelsL)+len(wheelsR)} wheel object(s)).")
         return {'FINISHED'}
 
 
