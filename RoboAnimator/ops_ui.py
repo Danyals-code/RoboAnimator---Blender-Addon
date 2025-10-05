@@ -1,4 +1,4 @@
-# ops_ui.py — Final refined UI with subtle spacing for readability
+# ops_ui.py — UI for True RoboAnimator (revised for wheels + calibrated import)
 import bpy
 from bpy.types import Panel
 
@@ -38,7 +38,7 @@ class SG_PT_Panel(Panel):
         header.label(text=title)
         if not is_open:
             return None
-        # add inner margin wrapper
+        # inner margin
         margin = box.column(align=False)
         margin.separator(factor=0.3)
         inner = margin.column(align=True)
@@ -60,23 +60,22 @@ class SG_PT_Panel(Panel):
         col = self._section(layout, "show_instructions", "Instructions")
         if col:
             c = col.column(align=True)
-            c.label(text="1) Animate chassis (location + rotation).")
-            c.label(text="2) Validate Motion (no sideways slip).")
-            c.label(text="3) Autocorrect: S-Curve or Linear.")
-            c.label(text="4) Pick Speed Profile.")
-            c.label(text="5) Build Cache → Attach Drivers or Bake.")
-            c.label(text="6) Export (Raw / Engineering CSV).")
+            c.label(text="1) Assign Chassis + Wheels in Calibration.")
+            c.label(text="2) Import CSV → animates chassis + tires.")
+            c.label(text="3) Validate Motion, then Autocorrect.")
+            c.label(text="4) Choose Speed Profile and bake/drive.")
+            c.label(text="5) Export (Raw / Engineering CSV).")
 
-        # ---------------- Selection + Calibration ----------------
+        # ---------------- Selection & Calibration ----------------
         col = self._section(layout, "show_selection", "Object Selection & Calibration")
         if col:
-            # Selection group
+            # Selection
             _maybe_prop(col, P, "chassis")
             _maybe_prop(col, P, "right_collection")
             _maybe_prop(col, P, "left_collection")
             _maybe_prop(col, P, "swap_lr")
 
-            col.separator(factor=2.0)  # <--- extra space between selection and calibration
+            col.separator(factor=2.0)  # spacing
 
             # Calibration / geometry
             _maybe_prop(col, P, "track_width")
@@ -85,9 +84,15 @@ class SG_PT_Panel(Panel):
             if not getattr(P, "auto_radius", True):
                 _maybe_prop(col, P, "wheel_radius")
 
-            col.separator(factor=2.0)  # <--- extra space before wheel setup
+            col.separator(factor=2.0)  # spacing before wheel setup
 
-            # Wheel setup
+            # Wheel setup — NEW visible props
+            # Prefer explicit single-wheel hook-up
+            _maybe_prop(col, P, "wheel_left")
+            _maybe_prop(col, P, "wheel_right")
+            # Spin axis used by importer (falls back internally if absent)
+            _maybe_prop(col, P, "wheel_spin_axis")
+            # Keep legacy options visible
             _maybe_prop(col, P, "wheel_axis")
             _maybe_prop(col, P, "rotation_mode")
             _maybe_prop(col, P, "sign_r")
@@ -100,14 +105,24 @@ class SG_PT_Panel(Panel):
         row.label(text="Import Animation", icon='ANIM')
 
         col = box.column(align=True)
-        col.operator("segway.import_csv_anim", icon='IMPORT')
+        chassis_ok = bool(getattr(P, "chassis", None))
+        r = col.row(align=True)
+        r.enabled = chassis_ok
+        op = r.operator("segway.import_csv_anim", text="Import CSV Animation", icon='IMPORT')
+        # Force using calibrated object so user doesn't need to select anything
+        try:
+            op.use_calibrated_object = True
+        except Exception:
+            pass
+
+        if not chassis_ok:
+            col.label(text="Set ‘Chassis’ in Calibration first.", icon='ERROR')
 
         # If the active object has an attached CSV, show its Text name for provenance
         obj = context.object
         if obj and isinstance(getattr(obj, "get", None), type(dict.get)) and 'roboanim_csv_text' in obj:
             col.separator()
             col.label(text=f"Attached CSV: {obj['roboanim_csv_text']}", icon='TEXT')
-
 
         # ---------------- Feasibility & Autocorrect ----------------
         col = self._section(layout, "show_feasibility", "Feasibility & Autocorrect")
@@ -125,7 +140,7 @@ class SG_PT_Panel(Panel):
             row_lin.enabled = getattr(P, "autocorrect_mode", "") == 'LINEAR'
             _maybe_prop(row_lin, P, "linear_rotation_fraction")
 
-            col.separator(factor=2.0)  # <--- space between autocorrect and speed profile
+            col.separator(factor=2.0)  # spacing
 
             # Speed profile
             _maybe_prop(col, P, "speed_profile")
@@ -142,7 +157,7 @@ class SG_PT_Panel(Panel):
             row_seg.enabled = getattr(P, "speed_profile", "") == 'PER_KEY_EASE'
             _maybe_prop(row_seg, P, "segment_ease_frames")
 
-            col.separator(factor=2.0)  # <--- space before buttons
+            col.separator(factor=2.0)
 
             # Operators
             r = col.row(align=True)

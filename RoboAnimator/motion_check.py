@@ -10,22 +10,72 @@ from math import pi
 # --- REPLACE your current SG_Props with this full version ---
 
 class SG_Props(bpy.types.PropertyGroup):
-    # Selection
-    chassis: bpy.props.PointerProperty(name="Chassis (animated)", type=bpy.types.Object)
-    right_collection: bpy.props.PointerProperty(name="Right Wheels (Collection)", type=bpy.types.Collection)
-    left_collection: bpy.props.PointerProperty(name="Left Wheels (Collection)", type=bpy.types.Collection)
-    swap_lr: bpy.props.BoolProperty(name="Swap L/R Sides", default=False)
+    # ---------- Selection ----------
+    chassis: bpy.props.PointerProperty(
+        name="Chassis (animated)",
+        type=bpy.types.Object
+    )
 
-    # Geometry / wheels
-    track_width: bpy.props.FloatProperty(name="Track Width (m)", default=0.25, min=1e-5, precision=5)
-    tire_spacing: bpy.props.FloatProperty(name="Distance Between Tires (m)", default=0.40, min=0.0, precision=5)
-    auto_radius: bpy.props.BoolProperty(name="Auto-detect Wheel Radius", default=True)
-    wheel_radius: bpy.props.FloatProperty(name="Wheel Radius (m)", default=0.06, min=1e-5, precision=5)
+    # NEW: Explicit single-wheel object hooks (preferred by importer)
+    wheel_left: bpy.props.PointerProperty(
+        name="Left Wheel",
+        type=bpy.types.Object,
+        description="Left wheel object for rotation animation"
+    )
+    wheel_right: bpy.props.PointerProperty(
+        name="Right Wheel",
+        type=bpy.types.Object,
+        description="Right wheel object for rotation animation"
+    )
+
+    # Existing: collections for multi-wheel setups (kept for compatibility)
+    right_collection: bpy.props.PointerProperty(
+        name="Right Wheels (Collection)",
+        type=bpy.types.Collection
+    )
+    left_collection: bpy.props.PointerProperty(
+        name="Left Wheels (Collection)",
+        type=bpy.types.Collection
+    )
+
+    swap_lr: bpy.props.BoolProperty(
+        name="Swap L/R Sides",
+        default=False
+    )
+
+    # ---------- Geometry / wheels ----------
+    track_width: bpy.props.FloatProperty(
+        name="Track Width (m)",
+        default=0.25, min=1e-5, precision=5
+    )
+    tire_spacing: bpy.props.FloatProperty(
+        name="Distance Between Tires (m)",
+        default=0.40, min=0.0, precision=5
+    )
+    auto_radius: bpy.props.BoolProperty(
+        name="Auto-detect Wheel Radius",
+        default=True
+    )
+    wheel_radius: bpy.props.FloatProperty(
+        name="Wheel Radius (m)",
+        default=0.06, min=1e-5, precision=5
+    )
+
+    # Existing axis (kept for back-compat)
     wheel_axis: bpy.props.EnumProperty(
         name="Wheel Rotation Axis",
         items=[('X','X',''),('Y','Y',''),('Z','Z','')],
         default='X'
     )
+
+    # NEW: Explicit spin axis (used by importer first, falls back to wheel_axis)
+    wheel_spin_axis: bpy.props.EnumProperty(
+        name="Wheel Spin Axis",
+        description="Local axis around which wheels spin (used by importer)",
+        items=[('X','X-axis',''),('Y','Y-axis',''),('Z','Z-axis','')],
+        default='Y'
+    )
+
     rotation_mode: bpy.props.EnumProperty(
         name="Rotation Mode",
         items=[('EULER','Euler',''),('QUAT','Quaternion','')],
@@ -47,13 +97,16 @@ class SG_Props(bpy.types.PropertyGroup):
         default=False,
     )
 
-    # Feasibility / Autocorrect (path geometry)
+    # ---------- Feasibility / Autocorrect (path geometry) ----------
     body_forward_axis: bpy.props.EnumProperty(
         name="Body Forward Axis",
         items=[('+X','Local +X',''), ('-X','Local -X',''), ('+Y','Local +Y',''), ('-Y','Local -Y','')],
         default='+Y'
     )
-    side_tol: bpy.props.FloatProperty(name="Sideways Tolerance (m/s)", default=0.02, min=0.0, precision=6)
+    side_tol: bpy.props.FloatProperty(
+        name="Sideways Tolerance (m/s)",
+        default=0.02, min=0.0, precision=6
+    )
 
     autocorrect_mode: bpy.props.EnumProperty(
         name="Autocorrect Mode (Path Geometry)",
@@ -74,7 +127,7 @@ class SG_Props(bpy.types.PropertyGroup):
         default=0.25, min=0.0, max=0.45, precision=3
     )
 
-    # Speed profiles (timing)
+    # ---------- Speed profiles (timing) ----------
     speed_profile: bpy.props.EnumProperty(
         name="Speed Profile (Timing)",
         items=[
@@ -100,8 +153,12 @@ class SG_Props(bpy.types.PropertyGroup):
         min=0, max=400, default=6,
     )
 
-    # CSV / units
-    csv_path: bpy.props.StringProperty(name="CSV File", default="//robot_anim.csv", subtype='FILE_PATH')
+    # ---------- CSV / units ----------
+    csv_path: bpy.props.StringProperty(
+        name="CSV File",
+        default="//robot_anim.csv",
+        subtype='FILE_PATH'
+    )
     sample_mode: bpy.props.EnumProperty(
         name="Sampling",
         items=[('FRAME','Every Frame (scene FPS)',''), ('FIXED','Fixed Rate (Hz)','')],
@@ -112,7 +169,7 @@ class SG_Props(bpy.types.PropertyGroup):
     angrate_unit: bpy.props.EnumProperty(name="Angular Rate", items=[('RPM','rpm',''),('RPS','rps',''),('DEGS','deg/s','')], default='RPM')
     length_unit: bpy.props.EnumProperty(name="Length Unit", items=[('M','meters',''),('CM','centimeters','')], default='M')
 
-    # Safety limits
+    # ---------- Safety limits ----------
     max_rpm: bpy.props.FloatProperty(
         name="Max Wheel Speed (RPM)",
         description="Hard limit on per-frame wheel speed. 0 = disabled.",
@@ -124,7 +181,7 @@ class SG_Props(bpy.types.PropertyGroup):
         min=0.0, soft_max=1_000_000.0, default=0.0,
     )
 
-    # UI foldouts
+    # ---------- UI foldouts ----------
     show_instructions: bpy.props.BoolProperty(name="Show Instructions", default=False)
     show_selection:   bpy.props.BoolProperty(name="Show Object Selection", default=True)
     show_calibration: bpy.props.BoolProperty(name="Show Calibration", default=False)
@@ -133,11 +190,22 @@ class SG_Props(bpy.types.PropertyGroup):
     show_anim_export: bpy.props.BoolProperty(name="Show Animation Data Export", default=False)
     show_csv_export:  bpy.props.BoolProperty(name="Show CSV Engineering Export", default=False)
 
-    # Keyframe export
-    other_export_path: bpy.props.StringProperty(name="Anim Data File", default="//anim_keyframes.csv", subtype='FILE_PATH')
-    other_export_format: bpy.props.EnumProperty(name="Format", items=[('CSV','CSV',''),('JSON','JSON','')], default='CSV')
-    other_angle_unit: bpy.props.EnumProperty(name="Angle Unit (Anim)", items=[('RAD','radians',''),('DEG','degrees','')], default='RAD')
-
+    # ---------- Keyframe export ----------
+    other_export_path: bpy.props.StringProperty(
+        name="Anim Data File",
+        default="//anim_keyframes.csv",
+        subtype='FILE_PATH'
+    )
+    other_export_format: bpy.props.EnumProperty(
+        name="Format",
+        items=[('CSV','CSV',''),('JSON','JSON','')],
+        default='CSV'
+    )
+    other_angle_unit: bpy.props.EnumProperty(
+        name="Angle Unit (Anim)",
+        items=[('RAD','radians',''),('DEG','degrees','')],
+        default='RAD'
+    )
 
 
 # ---------------------- Operators ----------------------
