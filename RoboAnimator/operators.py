@@ -30,7 +30,6 @@ class AutoRadius(bpy.types.Operator):
         self.report({'INFO'}, "Wheel radius = {:.4f} m".format(r))
         return {'FINISHED'}
 
-# legacy path validator now calls feasibility.analyze
 class ValidatePath(bpy.types.Operator):
     bl_idname = "robo.validate_path"
     bl_label = "Validate Path"
@@ -58,7 +57,6 @@ class AttachDrivers(bpy.types.Operator):
         self.report({'INFO'}, "Drivers: implement after cache math.")
         return {'FINISHED'}
 
-# feasibility buttons
 class ValidateMotion(bpy.types.Operator):
     bl_idname = "robo.validate_motion"
     bl_label = "Validate Motion"
@@ -72,16 +70,27 @@ class ValidateMotion(bpy.types.Operator):
 class AutoCorrectPath(bpy.types.Operator):
     bl_idname = "robo.autocorrect_path"
     bl_label = "Autocorrect"
-    bl_description = "Plan path autocorrection (S-curve or Bezier)"
+    bl_description = "Set path mode (S-curve or Linear) and prep for bake"
     def execute(self, ctx):
         res = autocorrect(ctx)
         self.report({'INFO'}, res.get("msg", "Autocorrect set"))
         return {'FINISHED'}
 
+class BakeMotion(bpy.types.Operator):
+    bl_idname = "robo.bake_motion"
+    bl_label = "Bake Motion"
+    bl_description = "Write explicit keys using selected path mode"
+    def execute(self, ctx):
+        from .feasibility import bake_motion
+        res = bake_motion(ctx)
+        level = 'INFO' if res.get("ok") else 'ERROR'
+        self.report({level}, res.get("msg", "Done"))
+        return {'FINISHED'}
+
 class RevertAutoCorrect(bpy.types.Operator):
     bl_idname = "robo.revert_autocorrect"
     bl_label = "Revert Autocorrect"
-    bl_description = "Clear planned autocorrection"
+    bl_description = "Restore pre-autocorrect curves and unmute constraints/NLA"
     def execute(self, ctx):
         res = revert_autocorrect(ctx)
         self.report({'INFO'}, res.get("msg", "Cleared"))

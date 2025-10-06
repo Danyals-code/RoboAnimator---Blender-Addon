@@ -19,6 +19,7 @@ from .operators import (
     AutoRadius,
     ValidatePath,
     BuildCache,
+    BakeMotion,
     AttachDrivers,
     ValidateMotion,
     AutoCorrectPath,
@@ -39,7 +40,7 @@ _CLASSES = (
     ValidateMotion,
     AutoCorrectPath,
     RevertAutoCorrect,
-    # ui
+    BakeMotion,
     MainPanel,
 )
 
