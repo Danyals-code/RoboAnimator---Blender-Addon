@@ -96,52 +96,42 @@ class SG_PT_Panel(Panel):
 
             col.separator(factor=2.0)  # spacing
 
-            # Calibration / geometry
             _maybe_prop(col, P, "track_width")
             _maybe_prop(col, P, "tire_spacing")
             _maybe_prop(col, P, "auto_radius")
             if not getattr(P, "auto_radius", True):
                 _maybe_prop(col, P, "wheel_radius")
 
-            col.separator(factor=2.0)  # spacing before wheel setup
+            col.separator(factor=2.0)
 
-            # Wheel setup — NEW visible props
-            # Prefer explicit single-wheel hook-up
-            _maybe_prop(col, P, "wheel_left")
-            _maybe_prop(col, P, "wheel_right")
-            # Spin axis used by importer (falls back internally if absent)
             _maybe_prop(col, P, "wheel_spin_axis")
-            # Keep legacy options visible
-            _maybe_prop(col, P, "wheel_axis")
             _maybe_prop(col, P, "rotation_mode")
             _maybe_prop(col, P, "sign_r")
             _maybe_prop(col, P, "sign_l")
             _maybe_prop(col, P, "wheel_forward_invert")
 
         # ---------------- Import Animation ----------------
-        box = layout.box()
-        row = box.row(align=True)
-        row.label(text="Import Animation", icon='ANIM')
+        col = self._section(layout, "show_import", "Import Animation")
+        if col:
+            chassis_ok = bool(getattr(P, "chassis", None))
 
-        col = box.column(align=True)
-        chassis_ok = bool(getattr(P, "chassis", None))
-        r = col.row(align=True)
-        r.enabled = chassis_ok
-        op = r.operator("segway.import_csv_anim", text="Import CSV Animation", icon='IMPORT')
-        # Force using calibrated object so user doesn't need to select anything
-        try:
-            op.use_calibrated_object = True
-        except Exception:
-            pass
+            r = col.row(align=True)
+            r.enabled = chassis_ok
+            op = r.operator("segway.import_csv_anim", text="Import CSV Animation", icon='IMPORT')
+            # Force using calibrated object so user doesn't need to select anything
+            try:
+                op.use_calibrated_object = True
+            except Exception:
+                pass
 
-        if not chassis_ok:
-            col.label(text="Set ‘Chassis’ in Calibration first.", icon='ERROR')
+            if not chassis_ok:
+                col.label(text="Set ‘Chassis’ in Calibration first.", icon='ERROR')
 
-        # If the active object has an attached CSV, show its Text name for provenance
-        obj = context.object
-        if obj and isinstance(getattr(obj, "get", None), type(dict.get)) and 'roboanim_csv_text' in obj:
-            col.separator()
-            col.label(text=f"Attached CSV: {obj['roboanim_csv_text']}", icon='TEXT')
+            # If the active object has an attached CSV, show its Text name for provenance
+            obj = context.object
+            if obj and isinstance(getattr(obj, "get", None), type(dict.get)) and 'roboanim_csv_text' in obj:
+                col.separator()
+                col.label(text=f"Attached CSV: {obj['roboanim_csv_text']}", icon='TEXT')
 
         # ---------------- Feasibility & Autocorrect ----------------
         col = self._section(layout, "show_feasibility", "Feasibility & Autocorrect")

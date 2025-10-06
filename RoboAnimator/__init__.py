@@ -25,7 +25,7 @@ from . import (
 modules = (
     motion_check,
     kinematics_rpm,
-    io_import,      # <--- added importer (before UI)
+    io_import,
     io_export,
     ops_ui,
     utils,

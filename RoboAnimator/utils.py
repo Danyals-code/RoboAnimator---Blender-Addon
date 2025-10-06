@@ -142,6 +142,35 @@ def _arc_to_t_from_lut(lut_norm, target_norm):
 def _lerp(a,b,t):
     return a*(1.0-t)+b*t
 
+
+# ---------------------- Chassis Key Poses ----------------------
+
+def _get_chassis_key_poses(P, ch):
+    frames = set()
+    ad = ch.animation_data
+    if ad and ad.action:
+        for fc in ad.action.fcurves:
+            if fc.data_path in ("location", "rotation_euler"):
+                for kp in fc.keyframe_points:
+                    frames.add(int(round(kp.co[0])))
+
+    if not frames:
+        return []
+
+    scn = bpy.context.scene
+    deps = bpy.context.evaluated_depsgraph_get()
+    out = []
+    for f in sorted(frames):
+        scn.frame_set(f)
+        deps.update()
+        mw = ch.matrix_world
+        loc = mw.translation
+        yaw = ch.matrix_world.to_euler('XYZ').z
+        heading = yaw_to_heading(P, yaw)
+        out.append((f, loc.x, loc.y, loc.z, yaw, heading))
+    return out
+
+
 # ---------------------- backup / restore chassis keys ----------------------
 def _collect_fcurves(obj):
     ad=obj.animation_data
@@ -280,4 +309,5 @@ __all__ = [
     "_edge_ease_progress","_edge_ease_progress_asym",
     "_obj_rest_quat",
     "_iter_wheels",
+    "_get_chassis_key_poses",
 ]

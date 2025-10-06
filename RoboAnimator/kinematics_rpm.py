@@ -13,6 +13,23 @@ from .utils import (
     _wrap, _unwrap,
 )
 
+# Accept both legacy ('X','Y','Z') and signed ('+X','-X', etc.) forms
+_AXIS_INDEX = {
+    'X': 0, 'Y': 1, 'Z': 2,
+    '+X': 0, '-X': 0,
+    '+Y': 1, '-Y': 1,
+    '+Z': 2, '-Z': 2,
+    0: 0, 1: 1, 2: 2,   # tolerate numeric forms
+}
+_AXIS_SIGN = {
+    'X': 1, 'Y': 1, 'Z': 1,
+    '+X': 1, '-X': -1,
+    '+Y': 1, '-Y': -1,
+    '+Z': 1, '-Z': -1,
+    0: 1, 1: 1, 2: 1,
+}
+
+
 # ───────────────────────────────
 # Local wheel resolution helpers
 # ───────────────────────────────
