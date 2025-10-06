@@ -1,5 +1,7 @@
 import bpy
 from .selection import auto_radius, refresh_wheels
+from .feasibility import analyze, autocorrect, revert_autocorrect
+from .rpm import build
 
 class RefreshWheels(bpy.types.Operator):
     bl_idname = "robo.refresh_wheels"
@@ -7,7 +9,9 @@ class RefreshWheels(bpy.types.Operator):
     bl_description = "Scan Left/Right collections and report wheel counts"
     def execute(self, ctx):
         info = refresh_wheels(ctx)
-        msg = f"L {info['L']} | R {info['R']} | Total {info['total']} / Expected {info['want']}"
+        msg = "L {} | R {} | Total {} / Expected {}".format(
+            info['L'], info['R'], info['total'], info['want']
+        )
         if info['mismatch']:
             self.report({'WARNING'}, "Count mismatch: " + msg)
         else:
@@ -23,19 +27,16 @@ class AutoRadius(bpy.types.Operator):
             r = auto_radius(ctx)
         except Exception as e:
             self.report({'ERROR'}, str(e)); return {'CANCELLED'}
-        self.report({'INFO'}, f"Wheel radius = {r:.4f} m")
+        self.report({'INFO'}, "Wheel radius = {:.4f} m".format(r))
         return {'FINISHED'}
 
-# The rest are frozen per your note; keeping stubs to keep panel functional.
-from .feasibility import check
-from .rpm import build
-
+# legacy path validator now calls feasibility.analyze
 class ValidatePath(bpy.types.Operator):
     bl_idname = "robo.validate_path"
     bl_label = "Validate Path"
-    bl_description = "Basic check of chassis animation"
+    bl_description = "Basic check of chassis animation (feasibility)"
     def execute(self, ctx):
-        res = check(ctx)
+        res = analyze(ctx)
         level = 'INFO' if res.get("ok") else 'WARNING'
         self.report({level}, res.get("msg", "Done"))
         return {'FINISHED'}
@@ -55,4 +56,33 @@ class AttachDrivers(bpy.types.Operator):
     bl_description = "Attach rotation drivers to wheels on selected axis"
     def execute(self, ctx):
         self.report({'INFO'}, "Drivers: implement after cache math.")
+        return {'FINISHED'}
+
+# feasibility buttons
+class ValidateMotion(bpy.types.Operator):
+    bl_idname = "robo.validate_motion"
+    bl_label = "Validate Motion"
+    bl_description = "Check sideways drift vs tolerance using chosen forward axis"
+    def execute(self, ctx):
+        res = analyze(ctx)
+        level = 'INFO' if res.get("ok") else 'WARNING'
+        self.report({level}, res.get("msg", ""))
+        return {'FINISHED'}
+
+class AutoCorrectPath(bpy.types.Operator):
+    bl_idname = "robo.autocorrect_path"
+    bl_label = "Autocorrect"
+    bl_description = "Plan path autocorrection (S-curve or Bezier)"
+    def execute(self, ctx):
+        res = autocorrect(ctx)
+        self.report({'INFO'}, res.get("msg", "Autocorrect set"))
+        return {'FINISHED'}
+
+class RevertAutoCorrect(bpy.types.Operator):
+    bl_idname = "robo.revert_autocorrect"
+    bl_label = "Revert Autocorrect"
+    bl_description = "Clear planned autocorrection"
+    def execute(self, ctx):
+        res = revert_autocorrect(ctx)
+        self.report({'INFO'}, res.get("msg", "Cleared"))
         return {'FINISHED'}
