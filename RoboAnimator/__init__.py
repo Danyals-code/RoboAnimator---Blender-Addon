@@ -59,3 +59,5 @@ def unregister():
     if hasattr(motion_check, "SG_Props"):
         del bpy.types.Scene.sg_props
         bpy.utils.unregister_class(motion_check.SG_Props)
+
+#hello
