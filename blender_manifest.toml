@@ -1,0 +1,18 @@
+schema_version = "1.0.0"
+
+id = "true_roboanimator"
+version = "1.0.1"
+name = "True RoboAnimator"
+tagline = "Robot motion to wheel RPM with CSV export"
+maintainer = "Danyal S."
+type = "add-on"
+
+blender_version_min = "4.2.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+
+[permissions]
+files = "Read and write CSV and animation data files"
+
+[build]
+paths = ["__init__.py", "License.txt", "README.md"]
