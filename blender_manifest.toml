@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "true_roboanimator"
-version = "1.0.1"
+version = "1.0.0"
 name = "True RoboAnimator"
 tagline = "Robot motion to wheel RPM with CSV export"
 maintainer = "Danyal S."
