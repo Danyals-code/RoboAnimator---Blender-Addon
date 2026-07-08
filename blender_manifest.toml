@@ -1,12 +1,13 @@
 schema_version = "1.0.0"
 
 id = "true_roboanimator"
-version = "1.0.0"
+version = "1.4.1"
 name = "True RoboAnimator"
-tagline = "Robot motion to wheel RPM with CSV export"
+tagline = "Chassis motion to per-wheel RPM (2/3/4/6-wheel configs) with CSV export"
 maintainer = "Danyal S."
 type = "add-on"
 
+# Runs on the current 4.2 LTS line and the 5.0 series.
 blender_version_min = "4.2.0"
 
 license = ["SPDX:GPL-3.0-or-later"]
