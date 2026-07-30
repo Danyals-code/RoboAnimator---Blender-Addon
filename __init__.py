@@ -13,7 +13,7 @@ import os
 import json
 import bisect
 from math import pi, sin, cos, atan2, sqrt, floor
-from mathutils import Vector
+from mathutils import Vector, Matrix
 
 
 # ---------------------- Blender 4.4+ slotted-action compatibility ----------------------
@@ -146,32 +146,56 @@ def _new_action_fcurve(action, data_path, index):
 
 # ---------------------- constants & keys ----------------------
 _AXIS_INDEX = {'X': 0, 'Y': 1, 'Z': 2}
-_DEFKEY = "SEGWAY_RPM_V2_DATA"         # driver_namespace store key
-_BACKUP_KEY = "RPM_AUTOCORRECT_BACKUP" # chassis keyframes backup (Text datablock)
+_DEFKEY = "SEGWAY_RPM_V2_DATA"                # legacy single-chassis key (fallback for old drivers)
+_DEFKEY_PREFIX = "SEGWAY_RPM_V2_DATA__"        # per-chassis cache key prefix
+_LASTKEY = "SEGWAY_RPM_V2_LAST_CHASSIS"        # name of most recently cached chassis
+_BACKUP_KEY = "RPM_AUTOCORRECT_BACKUP"         # chassis keyframes backup (Text datablock)
+_CACHE_TEXT_PREFIX = "SEGWAY_RPM_V2_CACHE__"   # persistent cache Text datablock prefix
 
-def _driver_key():
-    return _DEFKEY
+
+def _driver_key(ch=None):
+    """
+    Cache key in bpy.app.driver_namespace.
+      _driver_key(ch)    -> per-chassis key (multi-robot safe)
+      _driver_key()      -> legacy global key (backward-compat with old drivers)
+    """
+    if ch is None:
+        return _DEFKEY
+    return _DEFKEY_PREFIX + ch.name
 
 # ---------------------- math helpers ----------------------
+_TWO_PI = 2.0 * pi
+
 def _wrap(a):
-    while a <= -pi: a += 2*pi
-    while a >   pi: a -= 2*pi
-    return a
+    """Wrap an angle into (-pi, pi]. O(1) regardless of input magnitude."""
+    w = (a + pi) % _TWO_PI - pi
+    # Preserve the original half-open convention: a value of exactly -pi
+    # (which the modulo form returns as -pi) is normalised to +pi.
+    return pi if w == -pi else w
 
 def _unwrap(prev, cur):
+    """Return cur adjusted by 2*pi so it lies within (-pi, pi] of prev."""
     d = cur - prev
-    while d >  pi: cur -= 2*pi; d = cur - prev
-    while d < -pi: cur += 2*pi; d = cur - prev
-    return cur
+    if -pi < d <= pi:
+        return cur
+    n = floor((d + pi) / _TWO_PI)
+    return cur - n * _TWO_PI
 
 def _axis_unit(axis_char):
     return (1.0,0.0,0.0) if axis_char=='X' else (0.0,1.0,0.0) if axis_char=='Y' else (0.0,0.0,1.0)
 
 def _auto_radius(obj, axis='Y'):
+    """
+    Return the wheel's radius as half the largest dimension perpendicular
+    to the rotation axis. `obj.dimensions` is the local-space bounding
+    box multiplied by the object's scale, i.e. the wheel's physical world
+    extent — which is exactly what the rolling-without-slip constraint
+    needs, whether or not scale has been baked into the mesh.
+    """
     d = obj.dimensions
-    if axis=='Y': return 0.5*max(d.x,d.z)
-    if axis=='X': return 0.5*max(d.y,d.z)
-    return 0.5*max(d.x,d.y)
+    if axis=='Y': return 0.5*max(d.x, d.z)
+    if axis=='X': return 0.5*max(d.y, d.z)
+    return 0.5*max(d.x, d.y)
 
 def _ensure_xyz_euler(o):
     if getattr(o,'rotation_mode','XYZ')!='XYZ': o.rotation_mode='XYZ'
@@ -202,6 +226,31 @@ def heading_to_yaw(P, heading):
     elif fa=='+Y': return _wrap(heading - pi/2.0)
     else:          return _wrap(heading + pi/2.0)    # -Y
 
+
+def _chassis_yaw_from_matrix(ch, body_forward_axis):
+    """
+    Return "yaw" (per the current body-forward-axis convention) derived
+    from the world-space projection of the body's forward vector onto XY.
+    This is robust to chassis tilt (pitch/roll), unlike
+    matrix_world.to_euler('XYZ').z which is decomposition-dependent.
+
+    Falls back to the raw Euler decomposition only if the projected
+    forward is fully vertical, in which case yaw is genuinely undefined.
+    """
+    mw = ch.matrix_world
+    axis_char = _axis_char_from_body_forward(body_forward_axis)
+    sgn = -1.0 if body_forward_axis.startswith('-') else 1.0
+    lv = _axis_unit(axis_char)
+    world_fwd = mw.to_3x3() @ Vector((lv[0]*sgn, lv[1]*sgn, lv[2]*sgn))
+    if abs(world_fwd.x) + abs(world_fwd.y) < 1e-9:
+        return mw.to_euler('XYZ').z
+    heading = atan2(world_fwd.y, world_fwd.x)
+    fa = body_forward_axis
+    if   fa=='+X': return _wrap(heading)
+    elif fa=='-X': return _wrap(heading - pi)
+    elif fa=='+Y': return _wrap(heading - pi/2.0)
+    else:          return _wrap(heading + pi/2.0)
+
 # ---------------------- Bezier tools for S-curve ----------------------
 def _bezier_eval(P0,P1,P2,P3,t):
     mt=1.0-t
@@ -217,6 +266,8 @@ def _bezier_eval(P0,P1,P2,P3,t):
     return x,y,heading,kappa
 
 def _ease_in_out_cubic(u):
+    if u <= 0.0: return 0.0
+    if u >= 1.0: return 1.0
     if u<0.5: return 4*u*u*u
     v=2*u-2; return 0.5*v*v*v+1.0
 
@@ -284,27 +335,104 @@ def _arc_to_t_from_lut(lut_norm, target_norm):
 def _lerp(a,b,t): return a*(1.0-t)+b*t
 
 # ---------------------- backup / restore chassis keys ----------------------
+_BACKUP_PATHS = ("location", "rotation_euler", "rotation_quaternion")
+
 def _collect_fcurves(obj):
     ad = obj.animation_data
     if not (ad and ad.action):
         return []
     return [fc for fc in _iter_action_fcurves(ad.action)
-            if fc.data_path in ("location", "rotation_euler")]
+            if fc.data_path in _BACKUP_PATHS]
+
+def _backup_txt_key(ch):
+    """
+    Text-datablock name for a chassis backup. Uses ch.name so the backup
+    survives file save/reopen (session_uid does not). The JSON payload
+    ALSO carries the chassis name so `_find_backup_text` can locate a
+    backup even after the chassis was renamed.
+    """
+    return f"{_BACKUP_KEY}_{ch.name}"
+
+
+def _find_backup_text(ch):
+    """
+    Locate the backup Text for this chassis. Tries, in order:
+      1. Primary key (current chassis name).
+      2. Any text whose JSON payload's "_chassis" field matches this
+         chassis's name (finds pre-rename backups).
+      3. Legacy scheme (session_uid or scene+name from earlier versions).
+    """
+    primary = bpy.data.texts.get(_backup_txt_key(ch))
+    if primary is not None:
+        return primary
+    # Scan all backup-prefixed texts and match by embedded chassis name.
+    for txt in bpy.data.texts:
+        if not txt.name.startswith(_BACKUP_KEY):
+            continue
+        s = txt.as_string()
+        if not s:
+            continue
+        try:
+            data = json.loads(s)
+        except Exception:
+            continue
+        if data.get("_chassis") == ch.name:
+            return txt
+    # Legacy fallbacks (pre-R3 naming schemes).
+    for legacy_name in (
+        f"{_BACKUP_KEY}_uid{getattr(ch, 'session_uid', 0)}",
+        f"{_BACKUP_KEY}_{bpy.context.scene.name}_{ch.name}",
+    ):
+        t = bpy.data.texts.get(legacy_name)
+        if t is not None:
+            return t
+    return None
 
 def _backup_chassis_keys(ch):
-    data = {}
-    for fc in _collect_fcurves(ch):
+    """
+    Snapshot chassis fcurves into a Text datablock. If a backup already
+    exists (from a previous Autocorrect on this chassis) leave it alone
+    so repeated Autocorrects don't overwrite the original animation with
+    an already-baked one; Revert will restore the true original.
+
+    W8: chassis motion driven by constraints (Follow Path, Copy Location,
+    ...) leaves the fcurve backup empty, and the subsequent bake will
+    overwrite the constraint-driven pose with fcurves that fight the
+    constraints. We can't cleanly serialise a constraint stack, so we
+    emit a print()able warning via the module-level channel below.
+    """
+    txt_key = _backup_txt_key(ch)
+    existing = bpy.data.texts.get(txt_key)
+    if existing and existing.as_string():
+        return False
+    data = {
+        "_chassis": ch.name,
+        "_mode": getattr(ch, "rotation_mode", "XYZ"),
+    }
+    fcs = _collect_fcurves(ch)
+    for fc in fcs:
         key = f"{fc.data_path}[{fc.array_index}]"
         data[key] = [[float(kp.co[0]), float(kp.co[1])] for kp in fc.keyframe_points]
-    key = f"{_BACKUP_KEY}_{bpy.context.scene.name}_{ch.name}"
-    txt = bpy.data.texts.get(key) or bpy.data.texts.new(key)
+    txt = existing or bpy.data.texts.new(txt_key)
     txt.clear()
     txt.write(json.dumps(data))
+    # If the chassis has constraints AND no location/rotation fcurves,
+    # the backup is empty and Revert will silently no-op. Record that
+    # in the module warning channel for the caller to surface.
+    if not fcs and ch.constraints and len(ch.constraints) > 0:
+        _last_backup_warnings.append(
+            f"'{ch.name}' motion appears to come from constraints, not fcurves; "
+            f"backup is empty and Revert will not restore that motion.")
     return True
 
+
+# Warning channel written by _backup_chassis_keys and consumed by the
+# autocorrect operators immediately after they call it. Simpler than
+# threading a return value through every autocorrect path.
+_last_backup_warnings = []
+
 def _restore_chassis_keys(ch):
-    key = f"{_BACKUP_KEY}_{bpy.context.scene.name}_{ch.name}"
-    txt = bpy.data.texts.get(key)
+    txt = _find_backup_text(ch)
     if not txt or len(txt.as_string()) == 0:
         return False
     try:
@@ -312,18 +440,29 @@ def _restore_chassis_keys(ch):
     except Exception:
         return False
 
+    saved_mode = data.pop("_mode", "XYZ")
+    data.pop("_chassis", None)
+
     act = _ensure_action_for(ch, action_name="ChassisAction")
     for fc in list(_iter_action_fcurves(act)):
-        if fc.data_path in ("location", "rotation_euler"):
+        if fc.data_path in _BACKUP_PATHS:
             _remove_action_fcurve(act, fc)
 
-    _ensure_xyz_euler(ch)
-    for key, rows in data.items():
-        if key.startswith("location["):
-            path = "location"; idx = int(key.split("[")[1][0])
-        elif key.startswith("rotation_euler["):
-            path = "rotation_euler"; idx = int(key.split("[")[1][0])
-        else:
+    if saved_mode == "QUATERNION":
+        _ensure_quaternion(ch)
+    else:
+        _ensure_xyz_euler(ch)
+
+    for k, rows in data.items():
+        path = None
+        for p in _BACKUP_PATHS:
+            if k.startswith(f"{p}["):
+                path = p; break
+        if path is None:
+            continue
+        try:
+            idx = int(k.split("[")[1].split("]")[0])
+        except Exception:
             continue
         fc = _new_action_fcurve(act, path, idx)
         if fc is None:
@@ -383,8 +522,16 @@ def _wheel_slots_for(P, side):
 
 
 def _iter_side(P, side):
-    """Return the resolved list of wheel Objects on the given side."""
+    """Return the resolved list of wheel Objects on the given side.
+
+    The caster is only returned in the 3-wheel configuration; assigning
+    a caster while running a 2/4/6-wheel setup is treated as inert, so
+    stray assignments don't leak into batch operations like Clear or
+    Attach Drivers.
+    """
     if side == 'C':
+        if _wheel_count(P) != 3:
+            return []
         c = P.wheel_caster
         return [c] if (c and c.type in {'MESH', 'EMPTY'}) else []
     return [o for o in _wheel_slots_for(P, side)
@@ -420,83 +567,233 @@ def analyze_motion(context):
     scn=context.scene; deps=context.evaluated_depsgraph_get()
     if scn.frame_end<=scn.frame_start: raise RuntimeError("Scene frame range invalid.")
 
-    fps=scn.render.fps/scn.render.fps_base
+    fps=scn.render.fps/max(1e-9, scn.render.fps_base)
     dt=1.0/float(fps)
     f0,f1=scn.frame_start,scn.frame_end
-    scn.frame_set(f0); deps.update()
-    prev_loc=ch.matrix_world.translation.copy()
-    prev_yaw=ch.matrix_world.to_euler('XYZ').z
-
+    prev_current = scn.frame_current
     violations=0; v_frames=[]
-    for f in range(f0+1, f1+1):
-        scn.frame_set(f); deps.update()
-        loc=ch.matrix_world.translation
-        yaw=_unwrap(prev_yaw, ch.matrix_world.to_euler('XYZ').z)
-        yaw_mid=_wrap((prev_yaw+yaw)*0.5)
-        dp_x=loc.x-prev_loc.x; dp_y=loc.y-prev_loc.y
-        fwd,lat=_body_basis_from_yaw(yaw_mid, P.body_forward_axis)
-        dx=dp_x*fwd[0] + dp_y*fwd[1]
-        dy=dp_x*lat[0] + dp_y*lat[1]
-        if abs(dy) > (P.side_tol*dt): violations+=1; v_frames.append(f)
-        prev_loc=loc.copy(); prev_yaw=yaw
+    try:
+        scn.frame_set(f0); deps.update()
+        prev_loc=ch.matrix_world.translation.copy()
+        prev_yaw=_chassis_yaw_from_matrix(ch, P.body_forward_axis)
+        for f in range(f0+1, f1+1):
+            scn.frame_set(f); deps.update()
+            loc=ch.matrix_world.translation
+            yaw=_unwrap(prev_yaw, _chassis_yaw_from_matrix(ch, P.body_forward_axis))
+            yaw_mid=_wrap((prev_yaw+yaw)*0.5)
+            dp_x=loc.x-prev_loc.x; dp_y=loc.y-prev_loc.y
+            fwd,lat=_body_basis_from_yaw(yaw_mid, P.body_forward_axis)
+            dx=dp_x*fwd[0] + dp_y*fwd[1]
+            dy=dp_x*lat[0] + dp_y*lat[1]
+            if abs(dy) > (P.side_tol*dt): violations+=1; v_frames.append(f)
+            prev_loc=loc.copy(); prev_yaw=yaw
+    finally:
+        scn.frame_set(prev_current); deps.update()
     return {'f0':f0,'fps':fps,'track':track,'violations':violations,'violation_frames':v_frames,'side_tol':P.side_tol,'dt':dt}
 
 # ---------------------- gather keyed poses ----------------------
-def _get_chassis_key_poses(P,ch):
-    frames=set()
-    ad=ch.animation_data
+class _PoseList(list):
+    """List subclass that carries an optional .warnings attribute."""
+    warnings = ()
+
+
+def _get_chassis_key_poses(P, ch):
+    """
+    Return a _PoseList of (frame, x, y, z, yaw, heading) tuples, one per
+    LOCATION keyframe on the chassis. Rotation-only keys are ignored as
+    waypoints (they would inject phantom points at Blender-interpolated
+    positions the user didn't mean to visit); chassis rotation IS still
+    evaluated at each location-key frame via the depsgraph.
+
+    Also detects sub-frame keys that would collapse when rounded to
+    integer frames; the collision list is attached as `poses.warnings`
+    so callers can surface it to the user.
+    """
+    poses_frames = set()
+    warnings = []
+    ad = ch.animation_data
     if ad and ad.action:
+        raw_by_int = {}
         for fc in _iter_action_fcurves(ad.action):
-            if fc.data_path in ("location","rotation_euler"):
-                for kp in fc.keyframe_points:
-                    frames.add(int(round(kp.co[0])))
-    if not frames: return []
-    scn=bpy.context.scene; deps=bpy.context.evaluated_depsgraph_get()
-    out=[]
-    for f in sorted(frames):
-        scn.frame_set(f); deps.update()
-        mw=ch.matrix_world; loc=mw.translation
-        yaw=ch.matrix_world.to_euler('XYZ').z
-        heading=yaw_to_heading(P, yaw)
-        out.append((f, loc.x, loc.y, loc.z, yaw, heading))
+            if fc.data_path != "location":
+                continue
+            for kp in fc.keyframe_points:
+                fraw = float(kp.co[0])
+                fint = int(round(fraw))
+                poses_frames.add(fint)
+                if fint in raw_by_int:
+                    if abs(raw_by_int[fint] - fraw) > 1e-4:
+                        warnings.append(
+                            f"sub-frame collision at frame {fint}: keys at "
+                            f"{raw_by_int[fint]:.3f} and {fraw:.3f}")
+                else:
+                    raw_by_int[fint] = fraw
+    if not poses_frames:
+        return _PoseList()
+
+    scn = bpy.context.scene
+    deps = bpy.context.evaluated_depsgraph_get()
+    prev_current = scn.frame_current
+    out = _PoseList()
+    try:
+        for f in sorted(poses_frames):
+            scn.frame_set(f); deps.update()
+            mw = ch.matrix_world; loc = mw.translation
+            yaw = _chassis_yaw_from_matrix(ch, P.body_forward_axis)
+            heading = yaw_to_heading(P, yaw)
+            out.append((f, loc.x, loc.y, loc.z, yaw, heading))
+    finally:
+        scn.frame_set(prev_current); deps.update()
+    out.warnings = tuple(warnings)
+    return out
+
+
+def _smooth_intermediate_headings(poses):
+    """
+    Return a new pose list where every INTERMEDIATE waypoint (index 1..N-2)
+    has its heading replaced by the Catmull-Rom tangent through its two
+    neighbours: h_i = atan2(y[i+1] - y[i-1], x[i+1] - x[i-1]).
+
+    The first and last waypoints keep the user's keyed heading so that
+    start / end orientation is preserved. If a waypoint's neighbours are
+    at the same position (zero-length chord through the pair), the user's
+    keyed heading is left in place.
+
+    Fixes the "instantaneous rotation at sharp corners" issue where a
+    user-keyed heading disagrees with the natural chord tangent and drags
+    the Bezier tangent into a wild swing across the segment.
+    """
+    n = len(poses)
+    if n < 3:
+        return poses
+    out = _PoseList()
+    out.append(poses[0])
+    for i in range(1, n - 1):
+        f, x, y, z, yaw, h = poses[i]
+        px, py = poses[i - 1][1], poses[i - 1][2]
+        nx, ny = poses[i + 1][1], poses[i + 1][2]
+        dx = nx - px; dy = ny - py
+        if abs(dx) + abs(dy) < 1e-9:
+            out.append(poses[i])
+        else:
+            out.append((f, x, y, z, yaw, atan2(dy, dx)))
+    out.append(poses[-1])
+    out.warnings = getattr(poses, 'warnings', ())
     return out
 
 # ---------------------- bake helper ----------------------
+def _parent_frame_matrix(ch):
+    """
+    Return the world-space transform that ch.matrix_local is expressed in.
+    For an unparented object this is the identity; for a parented one it
+    is parent.matrix_world @ matrix_parent_inverse (per Blender's rule
+    matrix_world = parent_frame @ matrix_local).
+    """
+    if ch.parent is None:
+        return Matrix.Identity(4)
+    return ch.parent.matrix_world @ ch.matrix_parent_inverse
+
+
+def _apply_world_matrix_to_chassis(ch, world_mat, quat_mode):
+    """
+    Set ch.location and ch.rotation_(euler|quaternion) so its world pose
+    is `world_mat`. Composes with the parent frame so parented rigs land
+    correctly. CALLER is responsible for making sure the parent's world
+    transform is fresh at the frame being written (i.e. the depsgraph is
+    evaluated) - otherwise animated parents bake stale offsets.
+    """
+    local_mat = _parent_frame_matrix(ch).inverted() @ world_mat
+    loc, rot_q, _s = local_mat.decompose()
+    ch.location = loc
+    if quat_mode:
+        ch.rotation_quaternion = rot_q
+    else:
+        ch.rotation_euler = rot_q.to_euler('XYZ')
+
+
+def _apply_world_pose_to_chassis(ch, world_x, world_y, world_z, yaw, quat_mode):
+    """Convenience wrapper: compose a yaw-only world matrix and apply."""
+    world_mat = (Matrix.Translation((world_x, world_y, world_z)) @
+                 Matrix.Rotation(yaw, 4, 'Z'))
+    _apply_world_matrix_to_chassis(ch, world_mat, quat_mode)
+
+
 def _bake_chassis_frames_from_heading_samples(P, ch, samples):
-    _ensure_xyz_euler(ch)
+    """
+    Write per-frame chassis pose keyframes. samples are WORLD-space
+    (x, y, z, heading); this writer converts to the chassis's local
+    frame so parented chassis rigs bake correctly. For each sample we
+    step the scene to that frame BEFORE decomposing so an animated
+    parent's world transform is fresh; this makes rigs with animated
+    parents (nested rigs, robots on moving platforms) bake correctly.
+    Preserves the chassis's current rotation mode and its local scale.
+    """
     scn = bpy.context.scene
     deps = bpy.context.evaluated_depsgraph_get()
+    prev_current = scn.frame_current
+    quat_mode = getattr(ch, 'rotation_mode', 'XYZ') == 'QUATERNION'
+    orig_scale = ch.scale.copy()
+    parent_animated = ch.parent is not None
     act = _ensure_action_for(ch, action_name="ChassisAction")
     for fc in list(_iter_action_fcurves(act)):
-        if fc.data_path in ("location", "rotation_euler"):
+        if fc.data_path in ("location", "rotation_euler", "rotation_quaternion"):
             _remove_action_fcurve(act, fc)
-    for f, x, y, z, h in samples:
-        ch.location.x = x; ch.location.y = y; ch.location.z = z
-        ch.rotation_euler[0] = 0.0; ch.rotation_euler[1] = 0.0
-        ch.rotation_euler[2] = heading_to_yaw(P, h)
-        ch.keyframe_insert("location", frame=f, index=-1)
-        ch.keyframe_insert("rotation_euler", frame=f, index=-1)
-    deps.update()
-    scn.frame_set(scn.frame_start)
-    deps.update()
+    try:
+        for f, x, y, z, h in samples:
+            yaw = heading_to_yaw(P, h)
+            # Sample the parent's world transform at this frame so an
+            # animated parent (nested rig / moving platform) is folded
+            # in correctly.
+            if parent_animated:
+                scn.frame_set(int(round(f))); deps.update()
+            _apply_world_pose_to_chassis(ch, x, y, z, yaw, quat_mode)
+            if quat_mode:
+                ch.keyframe_insert("rotation_quaternion", frame=f, index=-1)
+            else:
+                ch.keyframe_insert("rotation_euler", frame=f, index=-1)
+            ch.keyframe_insert("location", frame=f, index=-1)
+        # Restore local scale (decompose gave us unit scale from world_mat).
+        ch.scale = orig_scale
+    finally:
+        scn.frame_set(prev_current); deps.update()
 
 # ---------------------- S-curve build + bake ----------------------
-def _build_s_ease_curve_segment(poseA, poseB, tangent_start, tangent_end):
+def _build_s_ease_curve_segment(poseA, poseB, tangent_start, tangent_end,
+                                align_mode='ALIGN'):
     """
     Cubic Bezier between two chassis waypoints. The start handle (P1)
     length is tangent_start * chord_distance, the end handle (P2) length
     is tangent_end * chord_distance. Both handles are clamped to at most
     0.49 * chord_distance so the curve never loops back on itself.
+
+    align_mode controls what happens when a user-keyed heading points more
+    than 90 degrees away from the chord (i.e. would require reverse
+    driving):
+      'ALIGN'  - silently flip the heading by 180 deg (pre-1.5 behavior).
+      'DETECT' - do not flip; the caller checks the returned flip count
+                 and decides whether to warn or raise.
+      'HONOR'  - do not flip; use the user's heading verbatim, even if the
+                 resulting Bezier loops back on itself.
+
+    Returns (P0, P1, P2, P3, flips_detected). flips_detected always counts
+    the number of endpoints where the user's heading was > 90 deg off
+    chord, regardless of align_mode, so the caller can report or raise.
     """
     (x0, y0, h0) = poseA
     (x3, y3, h3) = poseB
 
     chord = atan2(y3 - y0, x3 - x0)
-    def _align(h, ref):
-        a = _wrap(h - ref)
-        return h if abs(a) <= pi / 2 else _wrap(h + pi)
-    h0 = _align(h0, chord)
-    h3 = _align(h3, chord)
+
+    def _check(h, ref):
+        return abs(_wrap(h - ref)) > pi / 2
+
+    would_flip_0 = _check(h0, chord)
+    would_flip_3 = _check(h3, chord)
+
+    if align_mode == 'ALIGN':
+        if would_flip_0: h0 = _wrap(h0 + pi)
+        if would_flip_3: h3 = _wrap(h3 + pi)
+    # 'DETECT' and 'HONOR' both leave h0/h3 alone; caller uses flips_detected.
 
     P0 = (x0, y0); P3 = (x3, y3)
     dx = x3 - x0; dy = y3 - y0
@@ -508,7 +805,7 @@ def _build_s_ease_curve_segment(poseA, poseB, tangent_start, tangent_end):
 
     P1 = (x0 + L_start * cos(h0), y0 + L_start * sin(h0))
     P2 = (x3 - L_end   * cos(h3), y3 - L_end   * sin(h3))
-    return P0, P1, P2, P3
+    return P0, P1, P2, P3, int(would_flip_0) + int(would_flip_3)
 
 def build_s_ease_curve_and_bake(context):
     P=context.scene.sg_props; ch=P.chassis
@@ -537,30 +834,57 @@ def build_s_ease_curve_and_bake(context):
     poses=_get_chassis_key_poses(P,ch)
     if len(poses)<2: raise RuntimeError("Need at least two keyed poses on the chassis (location/rotation).")
 
-    segs=[]; total_len=0.0; spans=[]
+    # Option A: replace intermediate waypoint headings with the natural
+    # Catmull-Rom tangent through their neighbours. Prevents wild tangent
+    # swings inside a segment when the user keyed a rotation that
+    # disagrees with the chord direction.
+    if getattr(P, "intermediate_heading", 'AUTO_TANGENT') == 'AUTO_TANGENT':
+        poses = _smooth_intermediate_headings(poses)
+
+    # Option B: reverse policy decides how the Bezier handle placement
+    # reacts to user headings > 90 deg off chord.
+    reverse_policy = getattr(P, "reverse_policy", 'AUTO_ALIGN')
+    align_mode = {'FORWARD_ONLY': 'DETECT',
+                  'AUTO_ALIGN':   'ALIGN',
+                  'HONOR_HEADING':'HONOR'}.get(reverse_policy, 'ALIGN')
+
+    segs=[]; total_len=0.0; total_flips=0
     for i in range(len(poses)-1):
         fA,xA,yA,zA,_yA,hA=poses[i]
         fB,xB,yB,zB,_yB,hB=poses[i+1]
-        spans.append(max(1, fB-fA))
-        P0,P1,P2,P3=_build_s_ease_curve_segment((xA,yA,hA),(xB,yB,hB), tangent_start, tangent_end)
+        span=max(1, fB-fA)
+        P0,P1,P2,P3,flips=_build_s_ease_curve_segment(
+            (xA,yA,hA),(xB,yB,hB), tangent_start, tangent_end, align_mode)
+        total_flips += flips
         lut_norm,L=_build_arc_lut_norm_total_xy(P0,P1,P2,P3,steps=128)
         if L<=1e-12: continue
-        segs.append({"P0":P0,"P1":P1,"P2":P2,"P3":P3,"zA":zA,"zB":zB,"L":L,"lut":lut_norm})
+        segs.append({"P0":P0,"P1":P1,"P2":P2,"P3":P3,"zA":zA,"zB":zB,
+                     "L":L,"lut":lut_norm,"span":span})
         total_len+=L
+
+    if reverse_policy == 'FORWARD_ONLY' and total_flips > 0:
+        raise RuntimeError(
+            f"Reverse Policy = Forward Only, but {total_flips} waypoint "
+            f"heading(s) point > 90 deg off the segment chord (would need "
+            f"reverse driving). Switch Reverse Policy to Auto Align or "
+            f"Allow Reverse, or re-key the offending rotation(s).")
+
+    if not segs:
+        raise RuntimeError("All chassis segments have zero length; nothing to bake.")
 
     baked=[]; last_h=0.0
     cum_frames=[]; cum_len=[]; acc_f=0.0; acc_L=0.0
-    for i,seg in enumerate(segs):
-        acc_f+=spans[i]; acc_L+=seg["L"]
+    for seg in segs:
+        acc_f+=seg["span"]; acc_L+=seg["L"]
         cum_frames.append(acc_f); cum_len.append(acc_L)
+
+    if profile=='CONSTANT' and f_ramp >= 0.5:
+        raise RuntimeError("Ramp Frames too large: 2*R must be < total frames.")
 
     for f in range(f0, f1+1):
         tau=(f-f0)/max(1,total_frames)
 
         if profile=='CONSTANT':
-            # NEW/CHANGED: proper trapezoid mapping (no speed jump)
-            if f_ramp >= 0.5:
-                raise RuntimeError("Ramp Frames too large: 2*R must be < total frames.")
             s_norm = _trapezoid_s(tau, f_ramp)
             s_target=s_norm*total_len
             idx=bisect.bisect_left(cum_len, s_target); idx=min(max(idx,0),len(segs)-1)
@@ -568,7 +892,9 @@ def build_s_ease_curve_and_bake(context):
             seg=segs[idx]; frac=0.0 if seg["L"]<=1e-12 else (s_target-s_acc)/seg["L"]
 
         elif profile=='GLOBAL_EASE':
-            tau2=_edge_ease_progress(tau, ease_frac_tl)
+            # C1-continuous trapezoid over the whole timeline: no velocity
+            # jump at the join between ramp and cruise.
+            tau2=_trapezoid_s(tau, ease_frac_tl)
             s_target=tau2*total_len
             idx=bisect.bisect_left(cum_len, s_target); idx=min(max(idx,0),len(segs)-1)
             s_acc=0.0 if idx==0 else cum_len[idx-1]
@@ -580,8 +906,8 @@ def build_s_ease_curve_and_bake(context):
             fr_prev=0.0 if idx==0 else cum_frames[idx-1]
             span_f=max(1,int(round(cum_frames[idx]-fr_prev)))
             u=(tprime-fr_prev)/max(1e-9, span_f)
-            fin=fout = seg_ease_frames / max(1.0, span_f)
-            u=_edge_ease_progress_asym(u, fin, fout)
+            f_seg = max(0.0, min(0.499, seg_ease_frames / max(1.0, span_f)))
+            u=_trapezoid_s(max(0.0, min(1.0, u)), f_seg)
             seg=segs[idx]; frac=u
 
         t_param=_arc_to_t_from_lut(seg["lut"], frac)
@@ -594,7 +920,15 @@ def build_s_ease_curve_and_bake(context):
     byf={fr:(fr,x,y,z,h) for (fr,x,y,z,h) in baked}
     out=[byf[k] for k in sorted(byf.keys())]
     _bake_chassis_frames_from_heading_samples(P,ch,out)
-    return len(out)
+    # 'heading_flips' counts endpoints where user's keyed heading was
+    # > 90 deg off chord. Under AUTO_ALIGN they were silently rewritten
+    # (visible discontinuity possible at segment boundaries); under
+    # HONOR_HEADING they were used as-is (curve may loop back on itself);
+    # under FORWARD_ONLY the bake was refused before reaching here.
+    return {'n': len(out),
+            'heading_flips': total_flips,
+            'reverse_segments': 0,
+            'pose_warnings': list(getattr(poses, 'warnings', ()))}
 
 # ---------------------- Linear (rotate→move→rotate) ----------------------
 def _angle_lerp(prev,target,t):
@@ -602,9 +936,18 @@ def _angle_lerp(prev,target,t):
 
 def build_linear_path_and_bake(context):
     """
-    NEW/CHANGED for CONSTANT: apply the same global trapezoid arc-length mapping
-    across translation segments so 'Constant' behaves consistently here too.
-    Other profiles (GLOBAL_EASE, PER_KEY_EASE) unchanged.
+    Rotate-Move-Rotate integrator. Every segment splits into up to three
+    phases: rotate in place toward the destination, drive straight there,
+    then rotate to the final heading. Speed profile controls how the
+    straight-drive phase's arc-length is distributed across its frames.
+
+      CONSTANT     - trapezoid ramp/cruise per-move-phase.
+      GLOBAL_EASE  - a single timeline-wide trapezoid over the union of
+                     every move-phase's frame budget, so ease-in / ease-out
+                     span the whole run, not each segment individually.
+      PER_KEY_EASE - symmetric ease-in / ease-out inside every move phase.
+
+    All three profiles now use the C1-continuous trapezoid mapping.
     """
     P=context.scene.sg_props; ch=P.chassis
     if not ch: raise RuntimeError("Assign the Chassis.")
@@ -617,186 +960,190 @@ def build_linear_path_and_bake(context):
 
     seg_ease_frames=max(0, int(getattr(P,"segment_ease_frames",6)))
     const_ramp_frames=max(0, int(getattr(P,"constant_ramp_frames",0)))
+    timeline_ease_frames=max(0, int(getattr(P,"timeline_ease_frames",15)))
     f0,f1=scn.frame_start, scn.frame_end
-    total_frames=max(1, f1-f0)
-    f_ramp = (const_ramp_frames/total_frames) if total_frames>0 else 0.0  # NEW/CHANGED
 
     _backup_chassis_keys(ch)
     poses=_get_chassis_key_poses(P,ch)
     if len(poses)<2: raise RuntimeError("Need at least two keyed poses on the chassis (location/rotation).")
 
-    # Build segments with rotate-move-rotate behavior
-    segs=[]; spans=[]; total_len=0.0
+    # Option A: smooth intermediate headings with Catmull-Rom tangents.
+    if getattr(P, "intermediate_heading", 'AUTO_TANGENT') == 'AUTO_TANGENT':
+        poses = _smooth_intermediate_headings(poses)
+
+    # Option B: decide, per rotate_move_rotate segment, whether the chassis
+    # drives forward toward the destination or backs up toward it. Choice
+    # is driven by which of {dir_to_dest, dir_to_dest+pi} is closer to the
+    # user's keyed heading at the segment start.
+    reverse_policy = getattr(P, "reverse_policy", 'AUTO_ALIGN')
+    reverse_flips_detected = 0
+    reverse_used = 0
+
+    segs=[]
+    total_move_frames=0; total_move_len=0.0
     for i in range(len(poses)-1):
         fA,xA,yA,zA,_yA,hA=poses[i]
         fB,xB,yB,zB,_yB,hB=poses[i+1]
-        spans.append(max(1, fB-fA))
+        span=max(1, fB-fA)
         dx=xB-xA; dy=yB-yA
         L=sqrt(dx*dx+dy*dy)
-        
+
         if L<=1e-12:
-            # Pure rotation segment
-            segs.append({"mode":"rotonly","fA":fA,"fB":fB,"xA":xA,"yA":yA,"zA":zA,"xB":xB,"yB":yB,"zB":zB,"hA":hA,"hB":hB,"L":0.0})
+            segs.append({"mode":"rotonly","fA":fA,"fB":fB,
+                         "xA":xA,"yA":yA,"zA":zA,"xB":xB,"yB":yB,"zB":zB,
+                         "hA":hA,"hB":hB,"L":0.0,
+                         "span":span,"n1":0,"n2":0,"n3":0,
+                         "move_heading":hA,"is_reverse":False})
         else:
-            # Calculate direction to destination
-            dir_to_dest = atan2(dy, dx)
-            
-            # Create three sub-segments: rotate to face destination, move straight, rotate to final orientation
+            dir_to_dest=atan2(dy, dx)
+            # Which "facing" is closer to what the user keyed? Choosing the
+            # closer one keeps Phase 1 rotation cheap AND lets the user
+            # request reverse driving by keying a rearward-facing rotation.
+            err_fwd = abs(_wrap(hA - dir_to_dest))
+            err_rev = abs(_wrap(hA - _wrap(dir_to_dest + pi)))
+            wants_reverse = err_rev < err_fwd
+            if wants_reverse:
+                reverse_flips_detected += 1
+
+            if reverse_policy == 'HONOR_HEADING':
+                move_heading = _wrap(dir_to_dest + pi) if wants_reverse else dir_to_dest
+                is_reverse   = wants_reverse
+            else:
+                # AUTO_ALIGN and FORWARD_ONLY both drive forward toward the
+                # destination; FORWARD_ONLY additionally errors out below.
+                move_heading = dir_to_dest
+                is_reverse   = False
+
+            if is_reverse:
+                reverse_used += 1
+
+            n1=int(round(span*rot_frac))
+            n3=int(round(span*rot_frac))
+            # W15: if there's a real heading change to perform in phase 1
+            # (hA -> move_heading) or phase 3 (move_heading -> hB), ensure
+            # at least 1 frame is reserved for it — otherwise the chassis
+            # teleports through the rotation.
+            _ROT_EPS = 1e-4
+            if n1 == 0 and abs(_wrap(hA - move_heading)) > _ROT_EPS:
+                n1 = 1
+            if n3 == 0 and abs(_wrap(move_heading - hB)) > _ROT_EPS:
+                n3 = 1
+            n2=span-n1-n3
+            if n2<0:
+                shrink=-n2; s1=min(n1,(shrink+1)//2); s3=min(n3, shrink-s1)
+                n1-=s1; n3-=s3; n2=0
             segs.append({
                 "mode":"rotate_move_rotate",
                 "fA":fA,"fB":fB,"xA":xA,"yA":yA,"zA":zA,"xB":xB,"yB":yB,"zB":zB,
                 "hA":hA,"hB":hB,"L":L,
-                "dir_to_dest":dir_to_dest,  # Direction robot should face to move to destination
-                "final_heading":hB  # Final desired orientation
+                "dir_to_dest":dir_to_dest,"final_heading":hB,
+                "span":span,"n1":n1,"n2":n2,"n3":n3,
+                "move_heading":move_heading, "is_reverse":is_reverse,
             })
-            total_len+=L
+            total_move_frames+=n2
+            total_move_len+=L
 
-    cum_len=[]; acc_L=0.0
-    for s in segs:
-        if s.get("L",0.0)>0.0:
-            acc_L+=s["L"]
-        cum_len.append(acc_L)
+    if reverse_policy == 'FORWARD_ONLY' and reverse_flips_detected > 0:
+        raise RuntimeError(
+            f"Reverse Policy = Forward Only, but {reverse_flips_detected} "
+            f"segment(s) have a keyed heading > 90 deg off the direction to "
+            f"the next waypoint (would require reverse driving). Switch "
+            f"Reverse Policy to Auto Align or Allow Reverse, or re-key the "
+            f"offending rotation(s).")
+
+    # Pre-compute cumulative move-phase frame and arc offsets so GLOBAL_EASE
+    # can map a per-segment local frame to a global timeline position.
+    cum_move_before=[0]*len(segs); cum_arc_before=[0.0]*len(segs)
+    acc_mf=0; acc_L=0.0
+    for i,s in enumerate(segs):
+        cum_move_before[i]=acc_mf
+        cum_arc_before[i]=acc_L
+        if s["mode"]=="rotate_move_rotate":
+            acc_mf+=s["n2"]; acc_L+=s["L"]
+
+    f_ramp_global = 0.0
+    if profile=='GLOBAL_EASE' and total_move_frames>0:
+        f_ramp_global = max(0.0, min(0.499, timeline_ease_frames/total_move_frames))
+
+    def _move_progress(seg_i, local_k):
+        """Fraction of segment seg_i's arc completed at move-frame local_k (1..n2)."""
+        seg=segs[seg_i]
+        n2=seg["n2"]
+        if n2<=0: return 0.0
+        u_local=local_k/n2
+        if profile=='CONSTANT':
+            f_ramp=max(0.0, min(0.499, const_ramp_frames/n2))
+            return _trapezoid_s(u_local, f_ramp)
+        if profile=='PER_KEY_EASE':
+            f_seg=max(0.0, min(0.499, seg_ease_frames/n2))
+            return _trapezoid_s(u_local, f_seg)
+        # GLOBAL_EASE: trapezoid on global move-progress, then convert
+        # back to local arc fraction.
+        if total_move_frames<=0 or total_move_len<=1e-12:
+            return u_local
+        global_prog=(cum_move_before[seg_i]+local_k)/total_move_frames
+        global_s=_trapezoid_s(global_prog, f_ramp_global)
+        target_arc=global_s*total_move_len
+        local_arc=target_arc - cum_arc_before[seg_i]
+        return max(0.0, min(1.0, local_arc/max(1e-12, seg["L"])))
 
     baked=[]
+    for i, seg in enumerate(segs):
+        fA=seg["fA"]; fB=seg["fB"]
 
-    if profile=='CONSTANT':
-        if f_ramp >= 0.5:
-            raise RuntimeError("Ramp Frames too large: 2*R must be < total frames.")
-        
-        # For CONSTANT profile with rotate-move-rotate, we need to handle each segment's phases separately
-        for i, seg in enumerate(segs):
-            fA=seg["fA"]; fB=seg["fB"]; span=max(1, fB-fA)
-            
-            if seg["mode"] == "rotonly":
-                # Pure rotation segment - just rotate in place
-                hA=seg["hA"]; hB=seg["hB"]
-                baked.append((fA, seg["xA"], seg["yA"], seg["zA"], hA))
-                for s in range(1, span):
-                    u=s/span; t=_ease_in_out_cubic(u)
-                    h=_angle_lerp(hA, hB, t)
-                    baked.append((fA+s, seg["xA"], seg["yA"], seg["zA"], h))
-                baked.append((fB, seg["xB"], seg["yB"], seg["zB"], hB))
-                
-            elif seg["mode"] == "rotate_move_rotate":
-                # Apply CONSTANT speed profile to the movement phase only
-                hA=seg["hA"]; hB=seg["hB"]
-                dir_to_dest=seg["dir_to_dest"]
-                final_heading=seg["final_heading"]
-                
-                # Calculate frame distribution
-                n1=int(round(span*rot_frac))  # Rotate to face destination
-                n3=int(round(span*rot_frac))  # Rotate to final orientation  
-                n2=span-n1-n3  # Move straight
-                if n2<0:
-                    shrink=-n2; s1=min(n1,(shrink+1)//2); s3=min(n3, shrink-s1)
-                    n1-=s1; n3-=s3; n2=0
+        if seg["mode"]=="rotonly":
+            hA=seg["hA"]; hB=seg["hB"]; span=seg["span"]
+            baked.append((fA, seg["xA"], seg["yA"], seg["zA"], hA))
+            for s in range(1, span):
+                u=s/span; t=_ease_in_out_cubic(u)
+                h=_angle_lerp(hA, hB, t)
+                baked.append((fA+s, seg["xA"], seg["yA"], seg["zA"], h))
+            baked.append((fB, seg["xB"], seg["yB"], seg["zB"], hB))
+            continue
 
-                baked.append((fA, seg["xA"], seg["yA"], seg["zA"], hA)); idx=0
+        hA=seg["hA"]; final_heading=seg["final_heading"]
+        move_heading=seg["move_heading"]
+        n1=seg["n1"]; n2=seg["n2"]; n3=seg["n3"]
 
-                # Phase 1: Rotate in place to face destination (constant rotation speed)
-                if n1>0:
-                    for s in range(1,n1+1):
-                        u=s/n1; t=_ease_in_out_cubic(u)
-                        h=_angle_lerp(hA, dir_to_dest, t)
-                        baked.append((fA+idx+s, seg["xA"], seg["yA"], seg["zA"], h))
-                    idx+=n1
+        baked.append((fA, seg["xA"], seg["yA"], seg["zA"], hA)); idx=0
 
-                # Phase 2: Move straight with CONSTANT speed profile
-                if n2>0:
-                    # Apply trapezoid speed profile to the movement phase
-                    for s in range(1,n2+1):
-                        tau=s/n2
-                        s_norm=_trapezoid_s(tau, f_ramp)
-                        u=s_norm  # Use the trapezoid profile for movement
-                        x=seg["xA"]+u*(seg["xB"]-seg["xA"])
-                        y=seg["yA"]+u*(seg["yB"]-seg["yA"])
-                        z=seg["zA"]+u*(seg["zB"]-seg["zA"])
-                        baked.append((fA+idx+s, x, y, z, dir_to_dest))
-                    idx+=n2
+        if n1>0:
+            for s in range(1, n1+1):
+                u=s/n1; t=_ease_in_out_cubic(u)
+                h=_angle_lerp(hA, move_heading, t)
+                baked.append((fA+idx+s, seg["xA"], seg["yA"], seg["zA"], h))
+            idx+=n1
 
-                # Phase 3: Rotate in place to final orientation (constant rotation speed)
-                if n3>0:
-                    for s in range(1,n3+1):
-                        u=s/n3; t=_ease_in_out_cubic(u)
-                        h=_angle_lerp(dir_to_dest, final_heading, t)
-                        baked.append((fA+idx+s, seg["xB"], seg["yB"], seg["zB"], h))
-                    idx+=n3
+        if n2>0:
+            for s in range(1, n2+1):
+                u=_move_progress(i, s)
+                x=seg["xA"]+u*(seg["xB"]-seg["xA"])
+                y=seg["yA"]+u*(seg["yB"]-seg["yA"])
+                z=seg["zA"]+u*(seg["zB"]-seg["zA"])
+                # Chassis heading stays at move_heading throughout the
+                # drive phase; if is_reverse is True, this is exactly
+                # 180 deg off the direction of travel, so build_cache's
+                # body-frame dx projection comes out negative and the
+                # wheel-driver spins the tires backward.
+                baked.append((fA+idx+s, x, y, z, move_heading))
+            idx+=n2
 
-                baked.append((fB, seg["xB"], seg["yB"], seg["zB"], final_heading))
+        if n3>0:
+            for s in range(1, n3+1):
+                u=s/n3; t=_ease_in_out_cubic(u)
+                h=_angle_lerp(move_heading, final_heading, t)
+                baked.append((fA+idx+s, seg["xB"], seg["yB"], seg["zB"], h))
+            idx+=n3
 
-    else:
-        # NEW: Rotate-Move-Rotate behavior for realistic robot movement
-        for i, seg in enumerate(segs):
-            fA=seg["fA"]; fB=seg["fB"]; span=max(1, fB-fA)
-            
-            if seg["mode"] == "rotonly":
-                # Pure rotation segment
-                hA=seg["hA"]; hB=seg["hB"]
-                baked.append((fA, seg["xA"], seg["yA"], seg["zA"], hA))
-                for s in range(1, span):
-                    u=s/span; t=_ease_in_out_cubic(u)
-                    h=_angle_lerp(hA, hB, t)
-                    baked.append((fA+s, seg["xA"], seg["yA"], seg["zA"], h))
-                baked.append((fB, seg["xB"], seg["yB"], seg["zB"], hB))
-                
-            elif seg["mode"] == "rotate_move_rotate":
-                # Rotate to face destination, move straight, rotate to final orientation
-                hA=seg["hA"]; hB=seg["hB"]
-                dir_to_dest=seg["dir_to_dest"]
-                final_heading=seg["final_heading"]
-                
-                # Calculate frame distribution
-                n1=int(round(span*rot_frac))  # Rotate to face destination
-                n3=int(round(span*rot_frac))  # Rotate to final orientation  
-                n2=span-n1-n3  # Move straight
-                if n2<0:
-                    shrink=-n2; s1=min(n1,(shrink+1)//2); s3=min(n3, shrink-s1)
-                    n1-=s1; n3-=s3; n2=0
-
-                baked.append((fA, seg["xA"], seg["yA"], seg["zA"], hA)); idx=0
-
-                # Phase 1: Rotate in place to face destination
-                if n1>0:
-                    for s in range(1,n1+1):
-                        u=s/n1; t=_ease_in_out_cubic(u)
-                        h=_angle_lerp(hA, dir_to_dest, t)
-                        baked.append((fA+idx+s, seg["xA"], seg["yA"], seg["zA"], h))
-                    idx+=n1
-
-                # Phase 2: Move straight to destination
-                if n2>0:
-                    if profile=='GLOBAL_EASE':
-                        fin=fout=max(0.0, min(0.49, getattr(P,"timeline_ease_frames",15)/max(1.0,n2)))
-                        for s in range(1,n2+1):
-                            u=s/n2; u=_edge_ease_progress_asym(u, fin, fout)
-                            x=seg["xA"]+u*(seg["xB"]-seg["xA"])
-                            y=seg["yA"]+u*(seg["yB"]-seg["yA"])
-                            z=seg["zA"]+u*(seg["zB"]-seg["zA"])
-                            baked.append((fA+idx+s, x, y, z, dir_to_dest))
-                    else:  # PER_KEY_EASE
-                        fin=fout=seg_ease_frames/max(1.0,n2)
-                        for s in range(1,n2+1):
-                            u=s/n2; u=_edge_ease_progress_asym(u, fin, fout)
-                            x=seg["xA"]+u*(seg["xB"]-seg["xA"])
-                            y=seg["yA"]+u*(seg["yB"]-seg["yA"])
-                            z=seg["zA"]+u*(seg["zB"]-seg["zA"])
-                            baked.append((fA+idx+s, x, y, z, dir_to_dest))
-                    idx+=n2
-
-                # Phase 3: Rotate in place to final orientation
-                if n3>0:
-                    for s in range(1,n3+1):
-                        u=s/n3; t=_ease_in_out_cubic(u)
-                        h=_angle_lerp(dir_to_dest, final_heading, t)
-                        baked.append((fA+idx+s, seg["xB"], seg["yB"], seg["zB"], h))
-                    idx+=n3
-
-                baked.append((fB, seg["xB"], seg["yB"], seg["zB"], final_heading))
+        baked.append((fB, seg["xB"], seg["yB"], seg["zB"], final_heading))
 
     byf={fr:(fr,x,y,z,h) for (fr,x,y,z,h) in baked}
     out=[byf[k] for k in sorted(byf.keys())]
     _bake_chassis_frames_from_heading_samples(P,ch,out)
-    return len(out)
+    return {'n': len(out),
+            'heading_flips': reverse_flips_detected,
+            'reverse_segments': reverse_used,
+            'pose_warnings': list(getattr(poses, 'warnings', ()))}
 
 # ---------------------- Edge ease tools (used by other profiles) ----------------------
 def _edge_ease_progress(tau, ease_frac):
@@ -826,7 +1173,8 @@ def _edge_ease_progress_asym(u, fin, fout):
     return 0.5*fin + (u-mid0)*(1.0-0.5*fin-0.5*fout)/max(1e-12,m)
 
 # ---------------------- cache build for wheel drivers ----------------------
-def _wheel_sign_auto(wheel_obj, wheel_axis_char, body_fwd_world):
+def _wheel_sign_auto(wheel_obj, wheel_axis_char, body_fwd_world,
+                     warn_channel=None):
     """
     Return +1 or -1 so that a positive theta rolls the vehicle forward.
 
@@ -838,6 +1186,11 @@ def _wheel_sign_auto(wheel_obj, wheel_axis_char, body_fwd_world):
       stationary in the world frame, so v = -V * body_fwd.
       Solving: omega_scalar = V / (R * (A x z_hat) . body_fwd).
       Therefore sign(theta) = sign((A x up) . body_fwd) for V > 0.
+
+    W23: a nearly-vertical world-space axis is degenerate — a wheel spun
+    about world Z cannot produce forward roll on a horizontal ground. We
+    return +1 (the safe default) but append a diagnostic to warn_channel
+    (if given) so build_cache can surface a rig-setup mistake.
     """
     if not wheel_obj:
         return 1.0
@@ -849,9 +1202,27 @@ def _wheel_sign_auto(wheel_obj, wheel_axis_char, body_fwd_world):
     up = Vector((0.0, 0.0, 1.0))
     tangent = world_axis.cross(up)
     if tangent.length < 1e-9:
+        if warn_channel is not None:
+            warn_channel.append(
+                f"'{wheel_obj.name}' rotation axis is nearly vertical in "
+                f"world space; the wheel cannot roll forward on a "
+                f"horizontal surface. Check Wheel Rotation Axis and the "
+                f"wheel's world orientation.")
         return 1.0
     tangent.normalize()
-    return 1.0 if tangent.dot(body_fwd_world) > 0.0 else -1.0
+    dot = tangent.dot(body_fwd_world)
+    # H13: axis-parallel-to-body-forward is the other degenerate case —
+    # tangent ends up perpendicular to body forward, dot ≈ 0, sign is
+    # arbitrary from the user's perspective (a wheel whose axle points
+    # forward cannot roll the chassis forward).
+    if abs(dot) < 1e-4:
+        if warn_channel is not None:
+            warn_channel.append(
+                f"'{wheel_obj.name}' rotation axis is (nearly) parallel to "
+                f"the body-forward direction; spinning this wheel cannot "
+                f"produce forward motion. Check Wheel Rotation Axis vs. "
+                f"Body Forward Axis.")
+    return 1.0 if dot > 0.0 else -1.0
 
 
 def _obj_rest_quat(obj):
@@ -900,66 +1271,75 @@ def build_cache(context):
 
     scn = context.scene
     deps = context.evaluated_depsgraph_get()
-    fps = scn.render.fps / scn.render.fps_base
+    fps = scn.render.fps / max(1e-9, scn.render.fps_base)
     dt = 1.0 / float(fps)
     f0 = scn.frame_start; f1 = scn.frame_end
-
-    # Sample the chassis at the start frame so we can auto-derive per-wheel
-    # rotation signs from geometry: whichever way the wheel's local rotation
-    # axis actually points in world space, positive theta should mean forward
-    # roll.
-    scn.frame_set(f0); deps.update()
-    initial_yaw = ch.matrix_world.to_euler('XYZ').z
-    fwd_2d, _lat = _body_basis_from_yaw(initial_yaw, P.body_forward_axis)
-    body_fwd_world = Vector((fwd_2d[0], fwd_2d[1], 0.0))
-    if body_fwd_world.length < 1e-9:
-        body_fwd_world = Vector((0.0, 1.0, 0.0))
-    body_fwd_world.normalize()
-
-    signL = _wheel_sign_auto(wL0, P.wheel_axis, body_fwd_world)
-    signR = _wheel_sign_auto(wR0, P.wheel_axis, body_fwd_world)
-    signC = _wheel_sign_auto(wC,  P.wheel_axis, body_fwd_world) if wC else 1.0
+    prev_current = scn.frame_current
 
     thetaL = [0.0]; thetaR = [0.0]; thetaC = [0.0]
     pos_x = []; pos_y = []; yaw_z = []
-
-    prev_loc = ch.matrix_world.translation.copy()
-    prev_yaw = initial_yaw
-    pos_x.append(prev_loc.x); pos_y.append(prev_loc.y); yaw_z.append(prev_yaw)
-    tL = tR = tC = 0.0
     rpmL_list = [0.0]; rpmR_list = [0.0]; rpmC_list = [0.0]
 
-    # In diff-drive kinematics the two driven sides share the same formula
-    # regardless of how many wheels are mounted on each side; skid-steer 4/6
-    # configurations just replicate the per-side wheel angle onto extra wheels
-    # downstream. The caster (3-wheel only) rolls off dx alone.
-    for f in range(f0 + 1, f1 + 1):
-        scn.frame_set(f); deps.update()
-        loc = ch.matrix_world.translation
-        yaw = _unwrap(prev_yaw, ch.matrix_world.to_euler('XYZ').z)
-        yaw_mid = _wrap((prev_yaw + yaw) * 0.5)
+    try:
+        # Sample the chassis at the start frame so we can auto-derive per-wheel
+        # rotation signs from geometry: whichever way the wheel's local rotation
+        # axis actually points in world space, positive theta should mean forward
+        # roll.
+        scn.frame_set(f0); deps.update()
+        initial_yaw = _chassis_yaw_from_matrix(ch, P.body_forward_axis)
+        fwd_2d, _lat = _body_basis_from_yaw(initial_yaw, P.body_forward_axis)
+        body_fwd_world = Vector((fwd_2d[0], fwd_2d[1], 0.0))
+        if body_fwd_world.length < 1e-9:
+            body_fwd_world = Vector((0.0, 1.0, 0.0))
+        body_fwd_world.normalize()
 
-        dp_x = loc.x - prev_loc.x; dp_y = loc.y - prev_loc.y
-        fwd, _lat = _body_basis_from_yaw(yaw_mid, P.body_forward_axis)
-        dx = dp_x * fwd[0] + dp_y * fwd[1]
+        axis_warnings = []
+        signL = _wheel_sign_auto(wL0, P.wheel_axis, body_fwd_world, axis_warnings)
+        signR = _wheel_sign_auto(wR0, P.wheel_axis, body_fwd_world, axis_warnings)
+        # A real caster pivots freely about its steer axis, so its spin-axis
+        # orientation at frame 0 has no lasting meaning. ds_caster = dx is
+        # already signed to forward, so drive the caster's visual rotation
+        # with +1 regardless of how the wheel model is oriented at rest.
+        signC = 1.0
 
-        dpsi = yaw - prev_yaw
-        dsL = dx - 0.5 * b * dpsi
-        dsR = dx + 0.5 * b * dpsi
-        dthL = (dsL / radius) * signL
-        dthR = (dsR / radius) * signR
-        dthC = (dx  / radius) * signC  # caster: forward roll only
+        prev_loc = ch.matrix_world.translation.copy()
+        prev_yaw = initial_yaw
+        pos_x.append(prev_loc.x); pos_y.append(prev_loc.y); yaw_z.append(prev_yaw)
+        tL = tR = tC = 0.0
 
-        tL += dthL; tR += dthR; tC += dthC
-        thetaL.append(tL); thetaR.append(tR); thetaC.append(tC)
-        pos_x.append(loc.x); pos_y.append(loc.y); yaw_z.append(yaw)
+        # In diff-drive kinematics the two driven sides share the same formula
+        # regardless of how many wheels are mounted on each side; skid-steer 4/6
+        # configurations just replicate the per-side wheel angle onto extra wheels
+        # downstream. The caster (3-wheel only) rolls off dx alone.
+        for f in range(f0 + 1, f1 + 1):
+            scn.frame_set(f); deps.update()
+            loc = ch.matrix_world.translation
+            yaw = _unwrap(prev_yaw, _chassis_yaw_from_matrix(ch, P.body_forward_axis))
+            yaw_mid = _wrap((prev_yaw + yaw) * 0.5)
 
-        rpmL = (dthL * fps) * 60.0 / (2.0 * pi)
-        rpmR = (dthR * fps) * 60.0 / (2.0 * pi)
-        rpmC = (dthC * fps) * 60.0 / (2.0 * pi)
-        rpmL_list.append(rpmL); rpmR_list.append(rpmR); rpmC_list.append(rpmC)
+            dp_x = loc.x - prev_loc.x; dp_y = loc.y - prev_loc.y
+            fwd, _lat = _body_basis_from_yaw(yaw_mid, P.body_forward_axis)
+            dx = dp_x * fwd[0] + dp_y * fwd[1]
 
-        prev_loc = loc.copy(); prev_yaw = yaw
+            dpsi = yaw - prev_yaw
+            dsL = dx - 0.5 * b * dpsi
+            dsR = dx + 0.5 * b * dpsi
+            dthL = (dsL / radius) * signL
+            dthR = (dsR / radius) * signR
+            dthC = (dx  / radius) * signC  # caster: forward roll only
+
+            tL += dthL; tR += dthR; tC += dthC
+            thetaL.append(tL); thetaR.append(tR); thetaC.append(tC)
+            pos_x.append(loc.x); pos_y.append(loc.y); yaw_z.append(yaw)
+
+            rpmL = (dthL * fps) * 60.0 / (2.0 * pi)
+            rpmR = (dthR * fps) * 60.0 / (2.0 * pi)
+            rpmC = (dthC * fps) * 60.0 / (2.0 * pi)
+            rpmL_list.append(rpmL); rpmR_list.append(rpmR); rpmC_list.append(rpmC)
+
+            prev_loc = loc.copy(); prev_yaw = yaw
+    finally:
+        scn.frame_set(prev_current); deps.update()
 
     # Only the driven wheels are checked against the safety limits;
     # a caster is passive and its RPM is a diagnostic, not a spec.
@@ -997,12 +1377,23 @@ def build_cache(context):
         'restL': restL, 'restR': restR, 'restC': restC,
         'radius': radius, 'track': b,
         'num_wheels': _wheel_count(P),
+        'chassis': ch.name,
+        'frame_end': f1,
         'max_rpm_L': max(abs(r) for r in rpmL_list),
         'max_rpm_R': max(abs(r) for r in rpmR_list),
         'max_rpm_C': max(abs(r) for r in rpmC_list) if rpmC_list else 0.0,
         'violations': 0, 'violation_frames': [],
+        'axis_warnings': list(axis_warnings),
     }
-    bpy.app.driver_namespace[_driver_key()] = data
+    # Per-chassis key so two rigs in the same scene don't overwrite each
+    # other. Also mirror into the legacy global key so drivers written by
+    # earlier addon versions (no chassis argument) keep working.
+    bpy.app.driver_namespace[_driver_key(ch)] = data
+    bpy.app.driver_namespace[_driver_key()]   = data
+    bpy.app.driver_namespace[_LASTKEY]        = ch.name
+    # Persistence: serialise to a Text datablock so drivers still work
+    # after save / reopen (bpy.app.driver_namespace does not persist).
+    _write_cache_text(ch, data)
     return data
 
 # ---------------------- driver functions (for expressions) ----------------------
@@ -1016,19 +1407,38 @@ def _rest_quat_for(d, side):
     if side == 'R': return d.get('restR', (1.0, 0.0, 0.0, 0.0))
     return d.get('restC', (1.0, 0.0, 0.0, 0.0))
 
-def sg_theta(side, frame):
-    d = bpy.app.driver_namespace.get(_driver_key())
+def _lookup_cache(chassis=''):
+    """
+    Return the cache dict for a given chassis name, or fall back to the
+    last-built cache if the argument is empty (old driver expressions
+    that predate multi-chassis don't pass a name).
+    """
+    dn = bpy.app.driver_namespace
+    if chassis:
+        d = dn.get(_DEFKEY_PREFIX + str(chassis))
+        if d is not None:
+            return d
+    last = dn.get(_LASTKEY)
+    if last:
+        d = dn.get(_DEFKEY_PREFIX + str(last))
+        if d is not None:
+            return d
+    return dn.get(_DEFKEY)
+
+
+def sg_theta(side, frame, chassis=''):
+    d = _lookup_cache(chassis)
     if not d: return 0.0
     arr = _theta_array_for(d, side)
     i = int(frame - d['f0'])
     i = max(0, min(i, len(arr) - 1))
     return arr[i]
 
-def sg_quat_comp(side, frame, comp_index, axis_char):
-    d = bpy.app.driver_namespace.get(_driver_key())
+def sg_quat_comp(side, frame, comp_index, axis_char, chassis=''):
+    d = _lookup_cache(chassis)
     if not d:
         return (1.0, 0.0, 0.0, 0.0)[int(comp_index) % 4]
-    th = sg_theta(side, frame)
+    th = sg_theta(side, frame, chassis)
     ux, uy, uz = _axis_unit(axis_char)
     h = 0.5 * th; s = sin(h); c = cos(h)
     q_spin = (c, ux*s, uy*s, uz*s)
@@ -1040,11 +1450,11 @@ def sg_quat_comp(side, frame, comp_index, axis_char):
          aw*bz + ax*by - ay*bx + az*bw)
     return q[int(comp_index) % 4]
 
-def sg_quat_comp_obj(side, frame, comp_index, axis_char, rw, rx, ry, rz):
-    d=bpy.app.driver_namespace.get(_driver_key())
+def sg_quat_comp_obj(side, frame, comp_index, axis_char, rw, rx, ry, rz, chassis=''):
+    d = _lookup_cache(chassis)
     if not d:
         return (1.0,0.0,0.0,0.0)[int(comp_index)%4]
-    th=sg_theta(side, frame)
+    th = sg_theta(side, frame, chassis)
     ux,uy,uz=_axis_unit(axis_char)
     h=0.5*th; s=sin(h); c=cos(h)
     q_spin=(c,ux*s,uy*s,uz*s)
@@ -1059,6 +1469,86 @@ def sg_quat_comp_obj(side, frame, comp_index, axis_char, rw, rx, ry, rz):
 bpy.app.driver_namespace['sg_theta']=sg_theta
 bpy.app.driver_namespace['sg_quat_comp']=sg_quat_comp
 bpy.app.driver_namespace['sg_quat_comp_obj']=sg_quat_comp_obj
+
+
+# ---------------------- cache persistence (W7) ----------------------
+def _cache_text_name(ch):
+    return _CACHE_TEXT_PREFIX + ch.name
+
+
+def _sanitize_for_json(obj):
+    """
+    Replace non-finite floats (NaN, +/-inf) with 0.0 recursively so
+    json.dumps doesn't raise. Recurses into lists/tuples/dicts. Everything
+    else passes through unchanged.
+    """
+    if isinstance(obj, float):
+        # NaN != NaN, inf/-inf both fail this check via math.isfinite.
+        if obj != obj or obj == float('inf') or obj == float('-inf'):
+            return 0.0
+        return obj
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_for_json(v) for v in obj]
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+    return obj
+
+
+def _write_cache_text(ch, data):
+    """
+    Serialise a build_cache result to a Text datablock so drivers still
+    work after save / reopen. NaN / Inf floats are sanitised to 0.0; any
+    IO error is swallowed and reported via print() so a failed persist
+    doesn't tear down a successful build_cache (the in-memory cache in
+    bpy.app.driver_namespace remains valid for this session).
+    """
+    try:
+        clean = _sanitize_for_json(data)
+        txt_name = _cache_text_name(ch)
+        txt = bpy.data.texts.get(txt_name) or bpy.data.texts.new(txt_name)
+        txt.clear()
+        txt.write(json.dumps(clean, separators=(',', ':')))
+    except Exception as e:
+        print(f"[True RoboAnimator] Cache persistence failed for "
+              f"'{ch.name}': {e}. In-memory cache still valid; drivers "
+              f"will stop working after save/reopen unless Build Cache "
+              f"is re-run.")
+
+
+def _load_all_caches_from_texts():
+    """
+    Populate bpy.app.driver_namespace from every persisted cache text.
+    Each cache is stored under its per-chassis key. Deliberately does NOT
+    set _LASTKEY / legacy _DEFKEY: which chassis is "the most recent" is
+    an arbitrary iteration-order choice that would silently point legacy
+    (pre-W6) drivers at the wrong rig. Legacy drivers evaluate to 0
+    until the user runs Build Cache; new drivers already carry their
+    chassis name and don't depend on _LASTKEY.
+    """
+    dn = bpy.app.driver_namespace
+    for txt in bpy.data.texts:
+        if not txt.name.startswith(_CACHE_TEXT_PREFIX):
+            continue
+        try:
+            data = json.loads(txt.as_string())
+        except Exception as e:
+            # L32: surface parse failures via print so the user has some
+            # visibility into why their drivers aren't spinning.
+            print(f"[True RoboAnimator] Failed to load cache text "
+                  f"'{txt.name}': {e}")
+            continue
+        chassis_name = data.get('chassis') or txt.name[len(_CACHE_TEXT_PREFIX):]
+        dn[_DEFKEY_PREFIX + chassis_name] = data
+
+
+@bpy.app.handlers.persistent
+def _on_file_load(_dummy):
+    """load_post handler: rehydrate the driver-namespace cache from Texts."""
+    try:
+        _load_all_caches_from_texts()
+    except Exception as e:
+        # L32: surface the failure rather than dropping it silently.
+        print(f"[True RoboAnimator] load_post handler failed: {e}")
 
 # ---------------------- viewport visualization ----------------------
 # Thin GPU-drawn construction lines shown in every 3D View. Every time a
@@ -1095,7 +1585,13 @@ def _apply_scale_rot_mesh(obj):
     Bake scale and rotation into obj's mesh, preserving world location.
     Runs at the data level (no operator) so it is safe from a property
     update callback. Skips objects that would be surprising to modify:
-    non-mesh, parented, shared-mesh, animated, or already identity.
+    non-mesh, parented, shared-mesh, has shape keys, animated, or
+    already identity.
+
+    Shape keys are a hard skip: mesh.transform() only touches the basis
+    vertex coordinates and leaves relative shape-key offsets untransformed,
+    which silently corrupts shape-key output. Users can still apply the
+    transform manually via Object > Apply.
     """
     if obj is None or obj.type != 'MESH':
         return False
@@ -1107,6 +1603,8 @@ def _apply_scale_rot_mesh(obj):
     if mesh is None:
         return False
     if getattr(mesh, "users", 1) > 1:
+        return False
+    if getattr(mesh, "shape_keys", None) is not None:
         return False
 
     scale_ok = all(abs(s - 1.0) < 1e-6 for s in obj.scale)
@@ -1157,9 +1655,71 @@ def _on_body_forward_changed(self, context):
         self.wheel_axis = perp
 
 
+def _driver_axis_of(dcurve):
+    """
+    Return the wheel-axis character baked into a sg_theta / sg_quat_comp_obj
+    driver expression, or None if the expression doesn't match our shapes.
+    Used to detect drivers that reference a wheel axis different from the
+    panel's current wheel_axis so we can clear them cleanly (M16).
+    """
+    try:
+        expr = dcurve.driver.expression
+    except Exception:
+        return None
+    # sg_quat_comp_obj('<side>', frame, <c>, '<axis>', rw, rx, ry, rz, '<chassis>')
+    # sg_theta('<side>', frame, '<chassis>')
+    # Only sg_quat_comp_obj carries the axis; sg_theta drives on the axis
+    # index instead, so the axis is implicit in the fcurve's array_index.
+    if "sg_quat_comp_obj(" in expr:
+        # split by comma; axis is the 4th positional arg
+        try:
+            parts = expr.split(",")
+            axis_tok = parts[3].strip().strip("'\"")
+            return axis_tok if axis_tok in ('X', 'Y', 'Z') else None
+        except Exception:
+            return None
+    return None
+
+
+def _on_wheel_axis_changed(self, context):
+    """
+    M16: driver expressions bake the wheel axis, so a change to the panel
+    axis while drivers exist would silently drive the wrong channel /
+    quaternion component. Walk the configured wheels and clear any driver
+    whose baked axis no longer matches; the user is expected to re-Attach
+    Drivers after changing this. Redraws the viewport too.
+    """
+    _tag_viewport_redraw(self, context)
+    new_axis = getattr(self, "wheel_axis", 'X')
+    new_axis_i = _AXIS_INDEX.get(new_axis, 0)
+    cleared_any = False
+    for side in ('L', 'R', 'C'):
+        for obj in _iter_side(self, side):
+            ad = obj.animation_data
+            if not ad or not ad.drivers:
+                continue
+            # Copy list first — remove mutates.
+            for dcurve in list(ad.drivers):
+                axis_char = _driver_axis_of(dcurve)
+                stale_quat = (axis_char is not None and axis_char != new_axis)
+                stale_euler = (dcurve.data_path == "rotation_euler"
+                               and dcurve.array_index != new_axis_i)
+                if stale_quat or stale_euler:
+                    try:
+                        obj.driver_remove(dcurve.data_path, dcurve.array_index)
+                        cleared_any = True
+                    except Exception:
+                        pass
+    if cleared_any:
+        print(f"[True RoboAnimator] Wheel axis changed to '{new_axis}'; "
+              f"cleared stale wheel drivers. Re-run Attach Drivers.")
+
+
+_BODY_FORWARD_AXIS_CHAR = {'+X': 'X', '-X': 'X', '+Y': 'Y', '-Y': 'Y'}
+
 def _axis_char_from_body_forward(fa):
     """Map '+Y'/'-X'/... to just the axis character."""
-    return fa[-1] if fa and len(fa) >= 2 else 'Y'
+    return _BODY_FORWARD_AXIS_CHAR.get(fa, 'Y')
 
 
 def _iter_location_fcurves(ch):
@@ -1196,8 +1756,7 @@ def _chassis_backup_positions(ch):
     """List of (x, y, z) waypoints stored by the autocorrect backup, if any."""
     if not ch:
         return []
-    key = f"{_BACKUP_KEY}_{bpy.context.scene.name}_{ch.name}"
-    txt = bpy.data.texts.get(key)
+    txt = _find_backup_text(ch)
     if not txt or not txt.as_string():
         return []
     try:
@@ -1227,17 +1786,80 @@ def _chassis_backup_positions(ch):
     return out
 
 
+# Cached samples for the solution-path preview. The draw handler runs on
+# every viewport paint (~60 Hz during interaction), but the chassis fcurves
+# almost never change that fast. Fingerprint = (chassis, frame range,
+# fcurve keyframe count + first/last key coords) so we recompute only when
+# the underlying animation actually changes.
+_SOLUTION_PATH_MAX_SAMPLES = 400
+_SOLUTION_PATH_MAX_ENTRIES = 32   # LRU cap (rough)
+_solution_path_cache = {}
+
+
+def _location_fingerprint(ch, f0, f1):
+    fcs = _iter_location_fcurves(ch)
+    parts = [ch.name, int(f0), int(f1)]
+    for i, fc in enumerate(fcs):
+        if fc is None:
+            parts.append((i, 0)); continue
+        kps = fc.keyframe_points
+        n = len(kps)
+        if n == 0:
+            parts.append((i, 0)); continue
+        first = (float(kps[0].co[0]), float(kps[0].co[1]))
+        last  = (float(kps[n-1].co[0]), float(kps[n-1].co[1]))
+        parts.append((i, n, first, last))
+    return tuple(parts)
+
+
 def _chassis_smooth_path(ch, f0, f1, step=1):
-    """Dense sample of the current chassis fcurve interpolation."""
+    """
+    Dense sample of the current chassis fcurve interpolation. Automatically
+    caps sample count to _SOLUTION_PATH_MAX_SAMPLES so very long timelines
+    stay cheap to draw, and memoises the result until the fcurve
+    fingerprint changes.
+    """
     fcs = _iter_location_fcurves(ch)
     if not any(fcs):
         return []
+
+    f0 = int(f0); f1 = int(f1)
+    span = max(1, f1 - f0)
+    eff_step = max(int(step), span // _SOLUTION_PATH_MAX_SAMPLES, 1)
+
+    # W21: key by the chassis's session_uid when available (stable across
+    # undo/redo and name changes), else by name. id(ch) is not safe: it
+    # can alias to a different object after undo shuffle.
+    cache_key = getattr(ch, "session_uid", None) or ch.name
+    fp = (_location_fingerprint(ch, f0, f1), eff_step)
+    cached = _solution_path_cache.get(cache_key)
+    if cached and cached[0] == fp:
+        return cached[1]
+
     pts = []
-    for f in range(int(f0), int(f1) + 1, step):
+    for f in range(f0, f1 + 1, eff_step):
         x = fcs[0].evaluate(f) if fcs[0] else 0.0
         y = fcs[1].evaluate(f) if fcs[1] else 0.0
         z = fcs[2].evaluate(f) if fcs[2] else 0.0
         pts.append((x, y, z))
+    # Ensure the very last frame is included when eff_step > 1.
+    if pts and (f1 - f0) % eff_step != 0:
+        f = f1
+        x = fcs[0].evaluate(f) if fcs[0] else 0.0
+        y = fcs[1].evaluate(f) if fcs[1] else 0.0
+        z = fcs[2].evaluate(f) if fcs[2] else 0.0
+        pts.append((x, y, z))
+    # L38: cap dict size to keep long sessions from accumulating entries
+    # for every chassis ever hovered by the draw handler. Dict iteration
+    # in Python 3.7+ preserves insertion order, so popping the oldest
+    # non-current key gives a rough LRU.
+    _solution_path_cache[cache_key] = (fp, pts)
+    if len(_solution_path_cache) > _SOLUTION_PATH_MAX_ENTRIES:
+        for k in list(_solution_path_cache.keys()):
+            if k != cache_key:
+                _solution_path_cache.pop(k, None)
+                if len(_solution_path_cache) <= _SOLUTION_PATH_MAX_ENTRIES:
+                    break
     return pts
 
 
@@ -1425,8 +2047,7 @@ def _preview_backup_poses(P, ch):
     """(frame, x, y, z, yaw, heading) reconstructed from the autocorrect backup Text."""
     if not ch:
         return []
-    key = f"{_BACKUP_KEY}_{bpy.context.scene.name}_{ch.name}"
-    txt = bpy.data.texts.get(key)
+    txt = _find_backup_text(ch)
     if not txt or not txt.as_string():
         return []
     try:
@@ -1470,12 +2091,19 @@ def _preview_sease_geometry(P, poses, steps_per_seg=32):
     """
     tangent_start = P.bezier_tangent_start
     tangent_end   = P.bezier_tangent_end
+    # Mirror the actual bake so the preview reflects both new policies.
+    if getattr(P, "intermediate_heading", 'AUTO_TANGENT') == 'AUTO_TANGENT':
+        poses = _smooth_intermediate_headings(poses)
+    reverse_policy = getattr(P, "reverse_policy", 'AUTO_ALIGN')
+    align_mode = {'FORWARD_ONLY': 'DETECT',
+                  'AUTO_ALIGN':   'ALIGN',
+                  'HONOR_HEADING':'HONOR'}.get(reverse_policy, 'ALIGN')
     pts = []
     for i in range(len(poses) - 1):
         _fA, xA, yA, zA, _yA, hA = poses[i]
         _fB, xB, yB, zB, _yB, hB = poses[i + 1]
-        P0, P1, P2, P3 = _build_s_ease_curve_segment(
-            (xA, yA, hA), (xB, yB, hB), tangent_start, tangent_end)
+        P0, P1, P2, P3, _flips = _build_s_ease_curve_segment(
+            (xA, yA, hA), (xB, yB, hB), tangent_start, tangent_end, align_mode)
         for s in range(steps_per_seg + 1):
             t = s / steps_per_seg
             pt = _bezier_point_xy(P0, P1, P2, P3, t)
@@ -1628,9 +2256,14 @@ class SG_Props(bpy.types.PropertyGroup):
     wheel_radius: bpy.props.FloatProperty(name="Wheel Radius (m)", default=0.06, min=1e-5, precision=5)
     wheel_axis: bpy.props.EnumProperty(
         name="Wheel Rotation Axis",
-        description="Local axis the wheels spin around. Auto-set to be perpendicular to Body Forward Axis",
+        description=(
+            "Local axis the wheels spin around. Auto-set to be perpendicular "
+            "to Body Forward Axis. Changing this invalidates any existing "
+            "wheel drivers — they are cleared automatically so you know to "
+            "re-run Attach Drivers."
+        ),
         items=[('X','X',''),('Y','Y',''),('Z','Z','')],
-        default='X', update=_tag_viewport_redraw,
+        default='X', update=_on_wheel_axis_changed,
     )
     rotation_mode: bpy.props.EnumProperty(name="Rotation Mode", items=[('EULER','Euler',''),('QUAT','Quaternion','')], default='EULER')
 
@@ -1669,6 +2302,48 @@ class SG_Props(bpy.types.PropertyGroup):
         name="Rotation Fraction",
         description="Per segment, fraction of frames used for the initial and final rotations (each)",
         default=0.25, min=0.0, max=0.45, precision=3,
+        update=_tag_viewport_redraw,
+    )
+
+    # Heading & direction policy
+    intermediate_heading: bpy.props.EnumProperty(
+        name="Intermediate Heading",
+        description=(
+            "Where the chassis heading at INTERMEDIATE waypoints comes from. "
+            "Auto Tangent uses the natural chord tangent through neighbouring "
+            "waypoints so sharp corners no longer produce instantaneous "
+            "rotations. Endpoint (first/last) headings are always user-keyed."
+        ),
+        items=[
+            ('AUTO_TANGENT', "Auto Tangent (Catmull-Rom)",
+             "Derive heading at intermediate waypoints from the chord "
+             "through the neighbours (recommended)"),
+            ('USE_KEYED',    "Use Keyed Rotation",
+             "Use the chassis's keyed rotation at every waypoint verbatim "
+             "(pre-1.5 behavior)"),
+        ],
+        default='AUTO_TANGENT',
+        update=_tag_viewport_redraw,
+    )
+    reverse_policy: bpy.props.EnumProperty(
+        name="Reverse Policy",
+        description=(
+            "What to do when a user-keyed heading points more than 90 deg "
+            "off the direction to the next waypoint (which would require "
+            "reverse driving)."
+        ),
+        items=[
+            ('FORWARD_ONLY',  "Forward Only",
+             "Refuse to bake if any segment would need reverse driving"),
+            ('AUTO_ALIGN',    "Auto Align (silent forward)",
+             "Silently rewrite offending headings to face along the "
+             "chord; a warning reports the count"),
+            ('HONOR_HEADING', "Allow Reverse",
+             "Honor the user's heading. Linear mode drives the segment in "
+             "reverse (wheels spin backward). S-Ease keeps the user's "
+             "handles, which may loop the curve"),
+        ],
+        default='AUTO_ALIGN',
         update=_tag_viewport_redraw,
     )
 
@@ -1791,42 +2466,98 @@ class SG_OT_ValidateMotion(bpy.types.Operator):
 class SG_OT_AutocorrectBake(bpy.types.Operator):
     bl_idname="segway.autocorrect_bake"; bl_label="Autocorrect & Bake"
     bl_description="Bake using the selected Autocorrect Mode (S-Ease or Linear) with the chosen Speed Profile"
+    bl_options = {'REGISTER', 'UNDO'}
     def execute(self, context):
         P=context.scene.sg_props; mode=P.autocorrect_mode
+        _last_backup_warnings.clear()
+        result = None
+        err = None
         try:
-            if   mode=='SEASE':  n=build_s_ease_curve_and_bake(context)
-            elif mode=='LINEAR': n=build_linear_path_and_bake(context)
+            if   mode=='SEASE':  result=build_s_ease_curve_and_bake(context)
+            elif mode=='LINEAR': result=build_linear_path_and_bake(context)
             else: self.report({'ERROR'},"Set Autocorrect Mode to S-Ease or Linear."); return {'CANCELLED'}
         except Exception as e:
-            self.report({'ERROR'}, f"Autocorrect failed: {e}"); return {'CANCELLED'}
-        self.report({'INFO'}, f"Autocorrect baked {n} frames. Re-run Validate Motion."); return {'FINISHED'}
+            err = e
+        # R4: always surface backup warnings, even when the bake raised
+        # (a constraint-driven chassis, for example, triggers a warning
+        # BEFORE the "no keyed poses" raise fires).
+        for bw in _last_backup_warnings:
+            self.report({'WARNING'}, bw)
+        if err is not None:
+            self.report({'ERROR'}, f"Autocorrect failed: {err}"); return {'CANCELLED'}
+        n = result.get('n', 0)
+        flips = result.get('heading_flips', 0)
+        reverse_segs = result.get('reverse_segments', 0)
+        pose_warnings = result.get('pose_warnings', [])
+        policy = P.reverse_policy
 
-class SG_OT_AutocorrectSEase(bpy.types.Operator):
-    bl_idname="segway.autocorrect_sease"; bl_label="Autocorrect & Bake (Smooth S-Ease)"
-    def execute(self, context):
-        P=context.scene.sg_props
-        if P.autocorrect_mode!='SEASE': self.report({'ERROR'},"Set Autocorrect Mode to 'Smooth Curve (S-Ease)'."); return {'CANCELLED'}
-        try: n=build_s_ease_curve_and_bake(context)
-        except Exception as e: self.report({'ERROR'}, f"Autocorrect failed: {e}"); return {'CANCELLED'}
-        self.report({'INFO'}, f"Autocorrect baked {n} frames. Re-run Validate Motion."); return {'FINISHED'}
+        # Surface sub-frame keyframe collisions before the mode message so
+        # they don't get lost.
+        for w in pose_warnings[:3]:
+            self.report({'WARNING'}, f"Chassis pose extraction: {w}")
+        if len(pose_warnings) > 3:
+            self.report({'WARNING'},
+                        f"... and {len(pose_warnings)-3} more sub-frame collision(s).")
 
-class SG_OT_AutocorrectLinear(bpy.types.Operator):
-    bl_idname="segway.autocorrect_linear"; bl_label="Autocorrect & Bake (Linear: Rotate-Move-Rotate)"
-    def execute(self, context):
-        P=context.scene.sg_props
-        if P.autocorrect_mode!='LINEAR': self.report({'ERROR'},"Set Autocorrect Mode to 'Linear (Rotate-Move-Rotate)'."); return {'CANCELLED'}
-        try: n=build_linear_path_and_bake(context)
-        except Exception as e: self.report({'ERROR'}, f"Autocorrect failed: {e}"); return {'CANCELLED'}
-        self.report({'INFO'}, f"Linear autocorrect baked {n} frames. Re-run Validate Motion."); return {'FINISHED'}
+        if reverse_segs:
+            # HONOR_HEADING actually drove those segments in reverse.
+            self.report({'INFO'},
+                        f"Autocorrect baked {n} frames. {reverse_segs} segment(s) "
+                        f"driven in reverse (wheels will spin backward).")
+        elif flips and policy == 'AUTO_ALIGN':
+            self.report({'WARNING'},
+                        f"Autocorrect baked {n} frames. {flips} waypoint heading(s) "
+                        f"were silently flipped to face along the chord. Set "
+                        f"Reverse Policy to Allow Reverse if you meant reverse "
+                        f"driving, or to Forward Only to catch this at bake time.")
+        elif flips:
+            self.report({'INFO'},
+                        f"Autocorrect baked {n} frames. {flips} waypoint heading(s) "
+                        f"were > 90 deg off chord (kept verbatim under Allow Reverse).")
+        else:
+            self.report({'INFO'}, f"Autocorrect baked {n} frames. Re-run Validate Motion.")
+        return {'FINISHED'}
+
+def _invalidate_chassis_cache(ch):
+    """
+    Drop the wheel cache for `ch` from both the driver namespace and the
+    persistent Text datablock. Used by Revert Autocorrect so drivers no
+    longer spin wheels as if the (now-undone) autocorrected motion were
+    still in effect.
+    """
+    dn = bpy.app.driver_namespace
+    dn.pop(_driver_key(ch), None)
+    if dn.get(_LASTKEY) == ch.name:
+        dn.pop(_LASTKEY, None)
+        dn.pop(_DEFKEY, None)  # legacy mirror was pointing at this chassis
+    txt = bpy.data.texts.get(_cache_text_name(ch))
+    if txt is not None:
+        try:
+            bpy.data.texts.remove(txt)
+        except Exception:
+            pass
+
 
 class SG_OT_RevertAutocorrect(bpy.types.Operator):
     bl_idname="segway.revert_autocorrect"; bl_label="Revert Autocorrect"
+    bl_options = {'REGISTER', 'UNDO'}
     def execute(self, context):
         ch=context.scene.sg_props.chassis
         if not ch: self.report({'ERROR'},"Assign the Chassis."); return {'CANCELLED'}
         ok=_restore_chassis_keys(ch)
         if not ok: self.report({'ERROR'},"No backup found to restore."); return {'CANCELLED'}
-        self.report({'INFO'},"Original chassis keyframes restored."); return {'FINISHED'}
+        # H8: any wheel cache we built off the autocorrected motion now
+        # describes a path the chassis isn't following any more. Drop it
+        # so drivers stop lying and Build Cache has to be re-run.
+        had_cache = _driver_key(ch) in bpy.app.driver_namespace
+        _invalidate_chassis_cache(ch)
+        if had_cache:
+            self.report({'INFO'},
+                        "Original chassis keyframes restored. Wheel cache "
+                        "was invalidated — re-Build Cache before Attach Drivers.")
+        else:
+            self.report({'INFO'}, "Original chassis keyframes restored.")
+        return {'FINISHED'}
 
 def _active_sides(P):
     """('L', 'R') for 2/4/6-wheel configs; ('L', 'R', 'C') for the 3-wheel case."""
@@ -1837,27 +2568,71 @@ class SG_OT_AttachDrivers(bpy.types.Operator):
     bl_idname = "segway.attach_drivers"
     bl_label = "Attach Drivers"
     bl_description = "Attach rotation drivers to every configured wheel using the current cache"
+    bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
         P = context.scene.sg_props
-        if not bpy.app.driver_namespace.get(_driver_key()):
-            self.report({'ERROR'}, "Build Cache first (and pass validation)."); return {'CANCELLED'}
+        ch = P.chassis
+        if not ch:
+            self.report({'ERROR'}, "Assign the Chassis."); return {'CANCELLED'}
+        cache = bpy.app.driver_namespace.get(_driver_key(ch))
+        if not cache:
+            # Fall back to the legacy global key (a cache built before
+            # W6 landed) — but tell the user their cache is chassis-agnostic.
+            cache = bpy.app.driver_namespace.get(_driver_key())
+            if not cache:
+                self.report({'ERROR'}, "Build Cache first (and pass validation).")
+                return {'CANCELLED'}
+        # M15: cache num_wheels vs. current wheel_count mismatch. Cache
+        # only has thetaC when it was built for 3 wheels; caster wheels
+        # attached against a 2-wheel cache silently return 0.
+        cache_nw = int(cache.get('num_wheels', 2))
+        cur_nw = _wheel_count(P)
+        if cache_nw != cur_nw:
+            self.report({'WARNING'},
+                        f"Cache was built for {cache_nw}-wheel config but "
+                        f"current is {cur_nw}-wheel. Re-Build Cache to avoid "
+                        f"stale sign / caster data.")
         axis_i = _AXIS_INDEX[P.wheel_axis]
+        # H10: use repr() so any character in ch.name is safely encoded
+        # as a Python string literal (handles backslashes, quotes, and
+        # non-ASCII cleanly, and blocks any code-injection attempt via a
+        # crafted object name).
+        chassis_literal = repr(ch.name)
+        axis_literal = repr(P.wheel_axis)
 
         for side in _active_sides(P):
+            side_literal = repr(side)
             for obj in _iter_side(P, side):
-                # Wipe any existing rotation drivers on this wheel.
+                # Wipe any existing rotation drivers on this wheel...
                 try: obj.driver_remove("rotation_euler", axis_i)
                 except Exception: pass
                 try:
                     for i in range(4): obj.driver_remove("rotation_quaternion", i)
                 except Exception: pass
 
+                # ... and any stale rotation fcurves on the channels we're
+                # about to drive, so a previous Bake doesn't leak keys back
+                # in after a Clear (W9).
+                ad = obj.animation_data
+                if ad and ad.action:
+                    if P.rotation_mode == 'EULER':
+                        stale = [fc for fc in _iter_action_fcurves(ad.action)
+                                 if fc.data_path == "rotation_euler"
+                                 and fc.array_index == axis_i]
+                    else:
+                        stale = [fc for fc in _iter_action_fcurves(ad.action)
+                                 if fc.data_path == "rotation_quaternion"]
+                    for fc in stale:
+                        _remove_action_fcurve(ad.action, fc)
+
                 if P.rotation_mode == 'EULER':
                     _ensure_xyz_euler(obj)
                     dcurve = obj.driver_add("rotation_euler", axis_i)
                     dcurve.driver.type = 'SCRIPTED'
-                    dcurve.driver.expression = f"sg_theta('{side}', frame)"
+                    dcurve.driver.expression = (
+                        f"sg_theta({side_literal}, frame, {chassis_literal})"
+                    )
                 else:
                     _ensure_quaternion(obj)
                     # Capture rest BEFORE any driver stubs start evaluating.
@@ -1867,7 +2642,8 @@ class SG_OT_AttachDrivers(bpy.types.Operator):
                         dcurve = obj.driver_add("rotation_quaternion", comp)
                         dcurve.driver.type = 'SCRIPTED'
                         dcurve.driver.expression = (
-                            f"sg_quat_comp_obj('{side}', frame, {comp}, '{P.wheel_axis}', rw, rx, ry, rz)"
+                            f"sg_quat_comp_obj({side_literal}, frame, {comp}, "
+                            f"{axis_literal}, rw, rx, ry, rz, {chassis_literal})"
                         )
                         for vn, dp in (('rw', '["rest_w"]'), ('rx', '["rest_x"]'),
                                        ('ry', '["rest_y"]'), ('rz', '["rest_z"]')):
@@ -1876,7 +2652,7 @@ class SG_OT_AttachDrivers(bpy.types.Operator):
                             v.targets[0].id = obj
                             v.targets[0].data_path = dp
 
-        self.report({'INFO'}, "Drivers attached to configured wheels.")
+        self.report({'INFO'}, f"Drivers attached to configured wheels of '{ch.name}'.")
         return {'FINISHED'}
 
 
@@ -1884,12 +2660,18 @@ class SG_OT_BuildCache(bpy.types.Operator):
     bl_idname = "segway.build_cache"
     bl_label = "Build Cache"
     bl_description = "Integrate chassis motion into per-frame wheel angles and RPM"
+    # Undo must cover the persisted Text datablock the build creates,
+    # otherwise "undo Build Cache" leaves a zombie cache that reloads on
+    # next file open.
+    bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
         try:
             d = build_cache(context)
         except Exception as e:
             self.report({'ERROR'}, str(e)); return {'CANCELLED'}
+        for w in d.get('axis_warnings', []):
+            self.report({'WARNING'}, w)
         if d.get('num_wheels', 2) == 3:
             msg = (f"OK | r={d['radius']:.4f} m | track={d['track']:.4f} m | "
                    f"maxRPM L/R/C {d['max_rpm_L']:.1f}/{d['max_rpm_R']:.1f}/{d['max_rpm_C']:.1f}")
@@ -1904,15 +2686,41 @@ class SG_OT_Bake(bpy.types.Operator):
     bl_idname = "segway.bake_wheels"
     bl_label = "Bake Wheels"
     bl_description = "Convert the cached wheel angles into per-frame keyframes on every configured wheel"
+    bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
         P = context.scene.sg_props
-        d = bpy.app.driver_namespace.get(_driver_key())
+        ch = P.chassis
+        d = None
+        if ch:
+            d = bpy.app.driver_namespace.get(_driver_key(ch))
+        if d is None:
+            d = bpy.app.driver_namespace.get(_driver_key())
         if not d:
             self.report({'ERROR'}, "Build Cache first (and pass validation).")
             return {'CANCELLED'}
 
-        f0 = d['f0']; f1 = f0 + len(d['thetaL']) - 1
+        # M15: cache num_wheels vs. current wheel_count mismatch.
+        cache_nw = int(d.get('num_wheels', 2))
+        cur_nw = _wheel_count(P)
+        if cache_nw != cur_nw:
+            self.report({'WARNING'},
+                        f"Cache was built for {cache_nw}-wheel config but "
+                        f"current is {cur_nw}-wheel. Re-Build Cache to avoid "
+                        f"stale sign / caster data.")
+
+        # W5: warn if the scene frame range has drifted from what the
+        # cache covers, since Bake writes only cache-covered frames.
+        scn = context.scene
+        c_f0 = d.get('f0', scn.frame_start)
+        c_f1 = c_f0 + len(d.get('thetaL', [])) - 1
+        if scn.frame_start < c_f0 or scn.frame_end > c_f1:
+            self.report({'WARNING'},
+                        f"Cache covers frames {c_f0}..{c_f1} but scene range "
+                        f"is {scn.frame_start}..{scn.frame_end}. Frames outside "
+                        f"the cache will not be baked. Rebuild Cache to widen coverage.")
+
+        f0 = c_f0; f1 = c_f1
         axis_i = _AXIS_INDEX[P.wheel_axis]
         ux, uy, uz = _axis_unit(P.wheel_axis)
 
@@ -1926,8 +2734,30 @@ class SG_OT_Bake(bpy.types.Operator):
                     for i in range(4): obj.driver_remove("rotation_quaternion", i)
                 except Exception: pass
 
+                # Clear existing rotation fcurves on the channels we are
+                # about to write so old keys (e.g. from a previous bake over
+                # a different frame range) don't linger and interleave.
+                ad = obj.animation_data
+                if ad and ad.action:
+                    if P.rotation_mode == 'EULER':
+                        stale = [fc for fc in _iter_action_fcurves(ad.action)
+                                 if fc.data_path == "rotation_euler"
+                                 and fc.array_index == axis_i]
+                    else:
+                        stale = [fc for fc in _iter_action_fcurves(ad.action)
+                                 if fc.data_path == "rotation_quaternion"]
+                    for fc in stale:
+                        _remove_action_fcurve(ad.action, fc)
+
                 if P.rotation_mode == 'EULER':
                     _ensure_xyz_euler(obj)
+                    # M18: zero the other two Euler channels so a wheel that
+                    # had leftover pitch/roll from prior manipulation doesn't
+                    # keep it after the bake. Only axis_i gets a fcurve; the
+                    # other two remain at their static value 0.
+                    for j in (0, 1, 2):
+                        if j != axis_i:
+                            obj.rotation_euler[j] = 0.0
                 else:
                     _ensure_quaternion(obj)
 
@@ -1960,6 +2790,7 @@ class SG_OT_Clear(bpy.types.Operator):
     bl_idname = "segway.clear"
     bl_label = "Clear Drivers / Keys"
     bl_description = "Remove rotation drivers and rotation keyframes from every configured wheel"
+    bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
         P = context.scene.sg_props
@@ -1980,6 +2811,16 @@ class SG_OT_Clear(bpy.types.Operator):
                           or fc.data_path == "rotation_quaternion"]
                 for fc in to_del:
                     _remove_action_fcurve(ad.action, fc); removed_any = True
+
+            # W18: also drop the rest_w/x/y/z ID properties left over from
+            # a previous Attach Drivers in quaternion mode. Otherwise a
+            # future re-attach would pick up stale rest orientations.
+            for key in ('rest_w', 'rest_x', 'rest_y', 'rest_z'):
+                if key in obj:
+                    try:
+                        del obj[key]; removed_any = True
+                    except Exception:
+                        pass
 
             if P.rotation_mode == 'EULER':
                 try: obj.rotation_euler[axis_i] = 0.0
@@ -2003,13 +2844,24 @@ class SG_OT_ExportCSV(bpy.types.Operator):
 
     def execute(self, context):
         P = context.scene.sg_props
-        d = bpy.app.driver_namespace.get(_driver_key())
+        ch = P.chassis
+        d = None
+        if ch:
+            d = bpy.app.driver_namespace.get(_driver_key(ch))
+        if d is None:
+            d = bpy.app.driver_namespace.get(_driver_key())
         if not d:
             self.report({'ERROR'}, "Build Cache first (and pass validation)."); return {'CANCELLED'}
 
         include_c = d.get('num_wheels', 2) == 3
         path = bpy.path.abspath(P.csv_path)
+        # fps is the rate at which theta values were INTEGRATED (used to
+        # convert per-frame angle deltas into per-second rates); the emitted
+        # `t` column is scene-time so playback and CSV align. When the two
+        # disagree (user changed scene FPS after Build Cache), the header
+        # comment records both.
         fps = d['fps']; n = len(d['thetaL'])
+        scn_fps = context.scene.render.fps / max(1e-9, context.scene.render.fps_base)
         ang_k  = 1.0 if P.angle_unit == 'RAD' else 180.0 / pi
         yaw_k  = 180.0 / pi if P.angle_unit == 'DEG' else 1.0
         if   P.angrate_unit == 'RPM': rate_k = 60.0 / (2.0 * pi)
@@ -2032,7 +2884,7 @@ class SG_OT_ExportCSV(bpy.types.Operator):
 
         if P.sample_mode == 'FRAME':
             for i in range(n):
-                t   = i / fps
+                t   = i / scn_fps
                 thR = thR_phys[i]; thL = thL_phys[i]; thC = thC_phys[i]
                 x   = d['x'][i] * len_k; y = d['y'][i] * len_k
                 yaw = d['yaw'][i] * yaw_k
@@ -2079,6 +2931,15 @@ class SG_OT_ExportCSV(bpy.types.Operator):
         xu = 'x_m' if P.length_unit == 'M' else 'x_cm'
         yu = 'y_m' if P.length_unit == 'M' else 'y_cm'
 
+        # Precision matched to the chosen unit:
+        # angles in radians are small numbers where extra decimals matter;
+        # in degrees the same absolute precision needs fewer decimals.
+        # Rates in rpm are typically < 10^4; rad/s and deg/s are much smaller.
+        ang_fmt  = "{:.9f}" if P.angle_unit == 'RAD'  else "{:.6f}"
+        if   P.angrate_unit == 'RPM':  rate_fmt = "{:.4f}"
+        elif P.angrate_unit == 'RPS':  rate_fmt = "{:.6f}"
+        else:                          rate_fmt = "{:.5f}"  # deg/s
+
         try:
             with open(path, "w", encoding="utf-8") as f:
                 f.write("# theta/rate are PHYSICAL forward-roll values: "
@@ -2087,15 +2948,23 @@ class SG_OT_ExportCSV(bpy.types.Operator):
                 f.write(f"# num_wheels={d.get('num_wheels', 2)}, "
                         f"track_width_m={d.get('track', 0.0):.6f}, "
                         f"swap_lr={P.swap_lr}\n")
+                if abs(fps - scn_fps) > 1e-6:
+                    f.write(f"# NOTE: cached fps ({fps:.6f}) differs from scene "
+                            f"fps ({scn_fps:.6f}). The t column uses scene fps; "
+                            f"thetas/rates were integrated at cached fps. "
+                            f"Rebuild Cache to align them.\n")
                 if include_c:
                     f.write(f"t,{xu},{yu},yaw_{au},thetaR_{au},thetaL_{au},thetaC_{au},"
                             f"rateR_{ru},rateL_{ru},rateC_{ru}\n")
-                    fmt = "{:.6f},{:.6f},{:.6f},{:.9f},{:.9f},{:.9f},{:.9f},{:.4f},{:.4f},{:.4f}\n"
+                    fmt = ("{:.6f},{:.6f},{:.6f}," + ang_fmt + "," + ang_fmt + ","
+                           + ang_fmt + "," + ang_fmt + "," + rate_fmt + ","
+                           + rate_fmt + "," + rate_fmt + "\n")
                     for r in rows:
                         f.write(fmt.format(*r))
                 else:
                     f.write(f"t,{xu},{yu},yaw_{au},thetaR_{au},thetaL_{au},rateR_{ru},rateL_{ru}\n")
-                    fmt = "{:.6f},{:.6f},{:.6f},{:.9f},{:.9f},{:.9f},{:.4f},{:.4f}\n"
+                    fmt = ("{:.6f},{:.6f},{:.6f}," + ang_fmt + "," + ang_fmt + ","
+                           + ang_fmt + "," + rate_fmt + "," + rate_fmt + "\n")
                     for r in rows:
                         # Drop thetaC (index 6) and rateC (index 9).
                         f.write(fmt.format(r[0], r[1], r[2], r[3], r[4], r[5], r[7], r[8]))
@@ -2105,185 +2974,265 @@ class SG_OT_ExportCSV(bpy.types.Operator):
         return {'FINISHED'}
 
 # ---------------------- CSV Import ----------------------
+_DEG2RAD = pi / 180.0
+_LEN_UNIT_TO_M = {"m": 1.0, "cm": 0.01, "mm": 0.001}
+
+def _parse_csv_header(header):
+    """
+    Map every column name in `header` to a canonical role and a scale
+    factor that converts the raw value into the addon's internal units
+    (metres, radians). Returns (cols, time_kind) where:
+
+      cols[key]      = (column_index, unit_scale)
+      time_kind      = 'time' if the time column is seconds, 'frame' if it
+                       is an integer frame index, or None if absent.
+
+    Canonical keys used downstream:
+      time            -> seconds or frame (see time_kind)
+      x, y, z         -> metres
+      yaw             -> radians (chassis yaw)
+      euler_x/y/z     -> radians
+      quat_w/x/y/z    -> unitless
+      thetaL, thetaR  -> radians (per-wheel spin, physical forward-roll sign)
+      thetaC          -> radians
+    """
+    cols = {}
+    time_kind = None
+
+    def _len_scale(unit):
+        return _LEN_UNIT_TO_M.get(unit, 1.0)
+
+    for i, raw in enumerate(header):
+        name = raw.strip().lower()
+        if not name:
+            continue
+
+        # Time or frame column ------------------------------------------
+        if name == 'frame':
+            cols['time'] = (i, 1.0); time_kind = 'frame'; continue
+        if name in ('t', 'time', 'time_s', 't_s'):
+            cols['time'] = (i, 1.0); time_kind = 'time';  continue
+
+        # Position ------------------------------------------------------
+        if name == 'x' or name.startswith('x_'):
+            unit = name[2:] if name.startswith('x_') else 'm'
+            cols['x'] = (i, _len_scale(unit)); continue
+        if name == 'y' or name.startswith('y_'):
+            unit = name[2:] if name.startswith('y_') else 'm'
+            cols['y'] = (i, _len_scale(unit)); continue
+        if name == 'z' or name.startswith('z_'):
+            unit = name[2:] if name.startswith('z_') else 'm'
+            cols['z'] = (i, _len_scale(unit)); continue
+
+        # Chassis yaw ---------------------------------------------------
+        if name in ('yaw', 'yaw_rad'):
+            cols['yaw'] = (i, 1.0); continue
+        if name == 'yaw_deg':
+            cols['yaw'] = (i, _DEG2RAD); continue
+
+        # Chassis Euler / Quaternion -----------------------------------
+        for axis in ('x', 'y', 'z'):
+            if name == f'euler_{axis}' or name == f'euler_{axis}_rad':
+                cols[f'euler_{axis}'] = (i, 1.0); break
+            if name == f'euler_{axis}_deg':
+                cols[f'euler_{axis}'] = (i, _DEG2RAD); break
+        for comp in ('w', 'x', 'y', 'z'):
+            if name == f'quat_{comp}':
+                cols[f'quat_{comp}'] = (i, 1.0); break
+
+        # Wheel thetas --------------------------------------------------
+        for side_key, prefixes in (('thetaL', ('thetal',)),
+                                    ('thetaR', ('thetar',)),
+                                    ('thetaC', ('thetac',))):
+            matched = False
+            for pfx in prefixes:
+                if name == pfx or name == f'{pfx}_rad':
+                    cols[side_key] = (i, 1.0); matched = True; break
+                if name == f'{pfx}_deg':
+                    cols[side_key] = (i, _DEG2RAD); matched = True; break
+            if matched:
+                break
+
+    return cols, time_kind
+
+
 class SG_OT_ImportCSV(bpy.types.Operator):
     bl_idname="segway.import_csv"; bl_label="Import Animation from CSV"
     bl_description="Import animation data from CSV file and apply to selected objects"
-    
+    bl_options = {'REGISTER', 'UNDO'}
+
     def execute(self, context):
         P=context.scene.sg_props
         ch=P.chassis
-        
+
         if not ch:
             self.report({'ERROR'}, "Assign the Chassis first."); return {'CANCELLED'}
-        
+
         # Require at least one wheel per side for tire animation to have a target.
         if not _iter_side(P, 'L') or not _iter_side(P, 'R'):
             self.report({'ERROR'}, "Assign at least Left Wheel 01 and Right Wheel 01 before importing.")
             return {'CANCELLED'}
-        
+
         path=bpy.path.abspath(P.csv_import_path)
         if not path or not os.path.exists(path):
             self.report({'ERROR'}, f"CSV file not found: {path}"); return {'CANCELLED'}
-        
+
+        scn = context.scene
+        deps = context.evaluated_depsgraph_get()
+        prev_current = scn.frame_current
         try:
             import csv
-            
-            # Read CSV file
+
             with open(path, 'r', encoding='utf-8') as f:
                 reader = csv.reader(f)
                 rows = list(reader)
-            
-            # Skip header rows
+
             skip_rows = P.csv_import_skip_rows
             if skip_rows >= len(rows):
                 self.report({'ERROR'}, f"Skip rows ({skip_rows}) >= total rows ({len(rows)})"); return {'CANCELLED'}
-            
+
             data_rows = rows[skip_rows:]
             if not data_rows:
                 self.report({'ERROR'}, "No data rows found after skipping header rows"); return {'CANCELLED'}
-            
-            # Parse header row (first data row)
+
             header = data_rows[0]
-            data_rows = data_rows[1:]  # Remove header from data
-            
-            # Find column indices - match your actual CSV format
-            col_indices = {}
-            for i, col_name in enumerate(header):
-                col_name = col_name.strip().lower()
-                
-                # Match your actual CSV column names
-                if col_name == 't':
-                    col_indices['frame'] = i  # Use 't' as frame number
-                elif col_name == 'x_m':
-                    col_indices['x'] = i
-                elif col_name == 'y_m':
-                    col_indices['y'] = i
-                elif col_name == 'yaw_rad':
-                    col_indices['yaw'] = i  # This is rotation, not z position
-                elif col_name == 'thetar_rad':
-                    col_indices['thetaR'] = i
-                elif col_name == 'thetal_rad':
-                    col_indices['thetaL'] = i
-                # Also support the original format for compatibility
-                elif col_name == 'frame':
-                    col_indices['frame'] = i
-                elif col_name == 'x':
-                    col_indices['x'] = i
-                elif col_name == 'y':
-                    col_indices['y'] = i
-                elif col_name == 'z':
-                    col_indices['z'] = i
-                elif col_name == 'euler_x':
-                    col_indices['euler_x'] = i
-                elif col_name == 'euler_y':
-                    col_indices['euler_y'] = i
-                elif col_name == 'euler_z':
-                    col_indices['euler_z'] = i
-                elif col_name == 'quat_w':
-                    col_indices['quat_w'] = i
-                elif col_name == 'quat_x':
-                    col_indices['quat_x'] = i
-                elif col_name == 'quat_y':
-                    col_indices['quat_y'] = i
-                elif col_name == 'quat_z':
-                    col_indices['quat_z'] = i
-                elif col_name == 'thetar':
-                    col_indices['thetaR'] = i
-                elif col_name == 'thetal':
-                    col_indices['thetaL'] = i
-                elif col_name in ('thetac', 'thetac_rad'):
-                    col_indices['thetaC'] = i
-            
-            # Check required columns - your CSV format has t, x_m, y_m, yaw_rad
-            required_cols = ['frame', 'x', 'y']  # z is optional, yaw_rad is rotation
-            missing_cols = [col for col in required_cols if col not in col_indices]
-            if missing_cols:
-                self.report({'ERROR'}, f"Missing required columns: {missing_cols}")
-                self.report({'ERROR'}, f"Available columns: {[header[i] for i in range(len(header))]}")
+            data_rows = data_rows[1:]
+
+            cols, time_kind = _parse_csv_header(header)
+
+            required = ['time', 'x', 'y']
+            missing = [c for c in required if c not in cols]
+            if missing:
+                self.report({'ERROR'}, f"Missing required columns: {missing}")
+                self.report({'ERROR'}, f"Available columns: {header}")
                 self.report({'ERROR'}, f"Try adjusting 'Skip Rows from Top' setting (currently {skip_rows})")
                 return {'CANCELLED'}
-            
-            # Ensure action + slot, then clear existing chassis animation
+
+            max_col_idx = max(idx for idx, _s in cols.values())
+
+            has_yaw   = 'yaw' in cols
+            has_euler = all(f'euler_{a}' in cols for a in ('x', 'y', 'z'))
+            has_quat  = all(f'quat_{c}' in cols for c in ('w', 'x', 'y', 'z'))
+            rot_kind  = 'yaw' if has_yaw else ('quat' if has_quat else ('euler' if has_euler else None))
+
             act = _ensure_action_for(ch, action_name="ImportedAnimation")
+            # Only clear the fcurves this CSV will overwrite; leave other
+            # rotation channels alone so partial-column CSVs don't wipe
+            # unrelated existing animation.
+            paths_to_clear = {"location"}
+            if rot_kind in ('yaw', 'euler'):
+                paths_to_clear.add("rotation_euler")
+            elif rot_kind == 'quat':
+                paths_to_clear.add("rotation_quaternion")
             for fc in list(_iter_action_fcurves(act)):
-                if fc.data_path in ("location", "rotation_euler", "rotation_quaternion"):
+                if fc.data_path in paths_to_clear:
                     _remove_action_fcurve(act, fc)
 
-            # Use the scene's FPS and start frame so time columns align with
-            # the current scene, not with an arbitrary 30 FPS / frame-1 origin.
             scn = context.scene
             scene_fps = scn.render.fps / max(1e-9, scn.render.fps_base)
             base_frame = int(scn.frame_start)
 
-            # Process data rows
-            frames_processed = 0
-            for row in data_rows:
-                if len(row) <= max(col_indices.values()):
-                    continue  # Skip incomplete rows
+            time_idx, _ts = cols['time']
+            x_idx,  x_s   = cols['x']
+            y_idx,  y_s   = cols['y']
+            z_pair        = cols.get('z')
 
+            def _frame_of(row):
+                v = float(row[time_idx])
+                if time_kind == 'frame':
+                    return int(round(v))
+                # seconds -> scene frame
+                return int(round(v * scene_fps)) + base_frame
+
+            if rot_kind == 'yaw':
+                _ensure_xyz_euler(ch)
+            elif rot_kind == 'euler':
+                _ensure_xyz_euler(ch)
+            elif rot_kind == 'quat':
+                _ensure_quaternion(ch)
+
+            quat_mode_ch = getattr(ch, 'rotation_mode', 'XYZ') == 'QUATERNION'
+            parent_animated = ch.parent is not None
+
+            from mathutils import Euler, Quaternion
+
+            frames_processed = 0
+            rows_skipped = 0
+            frames_seen = set()
+            for row in data_rows:
+                if len(row) <= max_col_idx:
+                    rows_skipped += 1
+                    continue
                 try:
-                    # Parse frame number (t column in CSV contains time in seconds)
-                    time_seconds = float(row[col_indices['frame']])
-                    frame = int(round(time_seconds * scene_fps)) + base_frame
-                    
-                    # Parse position
-                    x = float(row[col_indices['x']])
-                    y = float(row[col_indices['y']])
-                    
-                    # Handle z position - use 0 if not available
-                    if 'z' in col_indices:
-                        z = float(row[col_indices['z']])
+                    frame = _frame_of(row)
+                    x = float(row[x_idx]) * x_s
+                    y = float(row[y_idx]) * y_s
+                    z = float(row[z_pair[0]]) * z_pair[1] if z_pair else 0.0
+
+                    # Compose a WORLD-space matrix for this row so parented
+                    # chassis rigs receive the correct local values. Step the
+                    # scene to this frame first if the parent is animated so
+                    # its world transform is fresh.
+                    if parent_animated:
+                        scn.frame_set(frame); deps.update()
+
+                    T = Matrix.Translation((x, y, z))
+                    if rot_kind == 'yaw':
+                        yaw_idx, yaw_s = cols['yaw']
+                        yaw = float(row[yaw_idx]) * yaw_s
+                        R = Matrix.Rotation(yaw, 4, 'Z')
+                    elif rot_kind == 'euler':
+                        ex_idx, ex_s = cols['euler_x']
+                        ey_idx, ey_s = cols['euler_y']
+                        ez_idx, ez_s = cols['euler_z']
+                        R = Euler((float(row[ex_idx]) * ex_s,
+                                   float(row[ey_idx]) * ey_s,
+                                   float(row[ez_idx]) * ez_s),
+                                  'XYZ').to_matrix().to_4x4()
+                    elif rot_kind == 'quat':
+                        qw_idx = cols['quat_w'][0]; qx_idx = cols['quat_x'][0]
+                        qy_idx = cols['quat_y'][0]; qz_idx = cols['quat_z'][0]
+                        R = Quaternion((float(row[qw_idx]),
+                                        float(row[qx_idx]),
+                                        float(row[qy_idx]),
+                                        float(row[qz_idx]))).to_matrix().to_4x4()
                     else:
-                        z = 0.0  # Default z position
-                    
-                    # Set chassis location
-                    ch.location = (x, y, z)
+                        R = Matrix.Identity(4)
+
+                    _apply_world_matrix_to_chassis(ch, T @ R, quat_mode_ch)
                     ch.keyframe_insert("location", frame=frame, index=-1)
-                    
-                    # Handle rotation - your CSV has yaw_rad
-                    if 'yaw' in col_indices:
-                        # Use yaw_rad for rotation
-                        _ensure_xyz_euler(ch)
-                        yaw = float(row[col_indices['yaw']])
-                        ch.rotation_euler = (0.0, 0.0, yaw)  # Only Z rotation (yaw)
-                        ch.keyframe_insert("rotation_euler", frame=frame, index=-1)
-                    elif all(col in col_indices for col in ['quat_w', 'quat_x', 'quat_y', 'quat_z']):
-                        # Use quaternion rotation
-                        _ensure_quaternion(ch)
-                        qw = float(row[col_indices['quat_w']])
-                        qx = float(row[col_indices['quat_x']])
-                        qy = float(row[col_indices['quat_y']])
-                        qz = float(row[col_indices['quat_z']])
-                        ch.rotation_quaternion = (qw, qx, qy, qz)
+                    if quat_mode_ch:
                         ch.keyframe_insert("rotation_quaternion", frame=frame, index=-1)
-                    elif all(col in col_indices for col in ['euler_x', 'euler_y', 'euler_z']):
-                        # Use euler rotation
-                        _ensure_xyz_euler(ch)
-                        ex = float(row[col_indices['euler_x']])
-                        ey = float(row[col_indices['euler_y']])
-                        ez = float(row[col_indices['euler_z']])
-                        ch.rotation_euler = (ex, ey, ez)
+                    else:
                         ch.keyframe_insert("rotation_euler", frame=frame, index=-1)
-                    
+
                     frames_processed += 1
-                    
-                except (ValueError, IndexError) as e:
-                    continue  # Skip invalid rows
-            
-            # Apply tire rotation to wheel objects if thetaR / thetaL columns exist.
-            # thetaC is applied to the caster if the 3-wheel config is active
-            # and a thetaC column is present.
-            if 'thetaR' in col_indices and 'thetaL' in col_indices:
+                    frames_seen.add(frame)
+                except (ValueError, IndexError):
+                    rows_skipped += 1
+                    continue
+
+            # H14: if every data row failed to parse, that's an error,
+            # not a happy "0 imported".
+            if frames_processed == 0 and rows_skipped > 0:
+                self.report({'ERROR'},
+                            f"Import failed: all {rows_skipped} data row(s) "
+                            f"could not be parsed. Check for locale-decimal "
+                            f"(use '.' not ','), correct column count per "
+                            f"row, and matching column names.")
+                return {'CANCELLED'}
+
+            # ----------------- wheel spin --------------------------------
+            wheel_frames = 0
+            if 'thetaR' in cols and 'thetaL' in cols:
                 axis_i = _AXIS_INDEX[P.wheel_axis]
                 ux, uy, uz = _axis_unit(P.wheel_axis)
 
                 sides_present = ['L', 'R']
-                if _wheel_count(P) == 3 and 'thetaC' in col_indices and _iter_side(P, 'C'):
+                if _wheel_count(P) == 3 and 'thetaC' in cols and _iter_side(P, 'C'):
                     sides_present.append('C')
 
-                # Clear existing wheel animation and capture each wheel's rest
-                # quaternion ONCE so subsequent spin composition doesn't drift.
-                wheel_rest = {}  # id(obj) -> (w,x,y,z)
+                wheel_rest = {}
                 for side in sides_present:
                     for obj in _iter_side(P, side):
                         if P.rotation_mode == 'EULER':
@@ -2298,28 +3247,33 @@ class SG_OT_ImportCSV(bpy.types.Operator):
 
                         ad = obj.animation_data
                         if ad and ad.action:
-                            to_del = [fc for fc in _iter_action_fcurves(ad.action)
-                                    if (fc.data_path == "rotation_euler" and fc.array_index == axis_i)
-                                    or fc.data_path == "rotation_quaternion"]
+                            if P.rotation_mode == 'EULER':
+                                to_del = [fc for fc in _iter_action_fcurves(ad.action)
+                                          if fc.data_path == "rotation_euler"
+                                          and fc.array_index == axis_i]
+                            else:
+                                to_del = [fc for fc in _iter_action_fcurves(ad.action)
+                                          if fc.data_path == "rotation_quaternion"]
                             for fc in to_del:
                                 _remove_action_fcurve(ad.action, fc)
 
                         wheel_rest[id(obj)] = _obj_rest_quat(obj)
 
-                # Apply tire rotations
-                for row in data_rows:
-                    if len(row) <= max(col_indices.values()):
-                        continue
+                thL_idx, thL_s = cols['thetaL']
+                thR_idx, thR_s = cols['thetaR']
+                thC_pair = cols.get('thetaC')
 
+                for row in data_rows:
+                    if len(row) <= max_col_idx:
+                        continue
                     try:
-                        time_seconds = float(row[col_indices['frame']])
-                        frame = int(round(time_seconds * scene_fps)) + base_frame
+                        frame = _frame_of(row)
                         thetas = {
-                            'L': float(row[col_indices['thetaL']]),
-                            'R': float(row[col_indices['thetaR']]),
+                            'L': float(row[thL_idx]) * thL_s,
+                            'R': float(row[thR_idx]) * thR_s,
                         }
-                        if 'C' in sides_present:
-                            thetas['C'] = float(row[col_indices['thetaC']])
+                        if 'C' in sides_present and thC_pair:
+                            thetas['C'] = float(row[thC_pair[0]]) * thC_pair[1]
 
                         for side in sides_present:
                             theta = thetas[side]
@@ -2341,16 +3295,20 @@ class SG_OT_ImportCSV(bpy.types.Operator):
                                     rq[0], rq[1], rq[2], rq[3] = q
                                     for comp in range(4):
                                         obj.keyframe_insert("rotation_quaternion", frame=frame, index=comp)
-
+                        wheel_frames += 1
                     except (ValueError, IndexError):
                         continue
-            
-            self.report({'INFO'}, f"Imported {frames_processed} frames from CSV. Chassis and wheel animations applied.")
+
+            self.report({'INFO'},
+                        f"Imported {frames_processed} chassis frame(s), "
+                        f"{wheel_frames} wheel frame(s) from CSV.")
             return {'FINISHED'}
-            
+
         except Exception as e:
             self.report({'ERROR'}, f"Failed to import CSV: {e}")
             return {'CANCELLED'}
+        finally:
+            scn.frame_set(prev_current); deps.update()
 
 # ---------------------- Keyframe Export ----------------------
 def _collect_keyframes(obj,fmin,fmax):
@@ -2365,15 +3323,26 @@ def _collect_keyframes(obj,fmin,fmax):
 
 class SG_OT_ExportKeyframes(bpy.types.Operator):
     bl_idname="segway.export_keyframes"; bl_label="Export Keyframes"
+    bl_description="Snapshot chassis pose at every keyframe. Wheel thetas are included when the wheel cache is present"
     def execute(self, context):
         scn=context.scene; P=scn.sg_props; ch=P.chassis
         if not ch: self.report({'ERROR'},"Assign the Chassis."); return {'CANCELLED'}
-        d=bpy.app.driver_namespace.get(_driver_key())
-        if not d: self.report({'ERROR'},"Build Cache first (and pass validation)."); return {'CANCELLED'}
-        f0=d['f0']; f1=f0+len(d['thetaL'])-1; fps=d['fps']
+        d = bpy.app.driver_namespace.get(_driver_key(ch))
+        if d is None:
+            d = bpy.app.driver_namespace.get(_driver_key())
+        # Cache is optional: without it the export still snapshots chassis
+        # pose at every keyframe; the thetaR/thetaL columns are just omitted.
+        include_thetas = bool(d)
+
+        scene_fps = scn.render.fps / max(1e-9, scn.render.fps_base)
+        if include_thetas:
+            f0 = d['f0']; f1 = f0 + len(d['thetaL']) - 1; fps = d['fps']
+        else:
+            f0 = int(scn.frame_start); f1 = int(scn.frame_end); fps = scene_fps
+
         kf=_collect_keyframes(ch, scn.frame_start, scn.frame_end) or [scn.frame_start, scn.frame_end]
         kf=[f for f in kf if f0<=f<=f1]
-        if not kf: self.report({'ERROR'},"No keyed frames fall inside the cache/frame range."); return {'CANCELLED'}
+        if not kf: self.report({'ERROR'},"No keyed frames fall inside the frame range."); return {'CANCELLED'}
         ang_k=1.0 if P.other_angle_unit=='RAD' else (180.0/pi)
         path=bpy.path.abspath(P.other_export_path)
         rows=[]; deps=context.evaluated_depsgraph_get(); prev=scn.frame_current
@@ -2381,31 +3350,42 @@ class SG_OT_ExportKeyframes(bpy.types.Operator):
             for f in kf:
                 scn.frame_set(f); deps.update()
                 mw=ch.matrix_world; loc=mw.translation; eul=mw.to_euler('XYZ'); quat=mw.to_quaternion()
-                idx=f-f0; thR=d['thetaR'][idx]*ang_k; thL=d['thetaL'][idx]*ang_k
-                rows.append({
+                row = {
                     "frame": int(f), "fps": float(fps), "time_s": float((f - f0)/fps),
                     "x": float(loc.x), "y": float(loc.y), "z": float(loc.z),
                     "euler_x": float(eul.x*ang_k), "euler_y": float(eul.y*ang_k), "euler_z": float(eul.z*ang_k),
                     "quat_w": float(quat.w), "quat_x": float(quat.x), "quat_y": float(quat.y), "quat_z": float(quat.z),
-                    "thetaR": float(thR), "thetaL": float(thL)
-                })
+                }
+                if include_thetas:
+                    idx = f - f0
+                    row["thetaR"] = float(d['thetaR'][idx] * ang_k)
+                    row["thetaL"] = float(d['thetaL'][idx] * ang_k)
+                rows.append(row)
         finally:
             scn.frame_set(prev); deps.update()
         try:
             if P.other_export_format=='CSV':
                 with open(path,"w",encoding="utf-8") as f:
-                    f.write(f"# keyframes_only=1, angle_unit={P.other_angle_unit}\n")
-                    f.write("frame,fps,time_s,x,y,z,euler_x,euler_y,euler_z,quat_w,quat_x,quat_y,quat_z,thetaR,thetaL\n")
+                    f.write(f"# keyframes_only=1, angle_unit={P.other_angle_unit}, "
+                            f"wheel_cache={'yes' if include_thetas else 'no'}\n")
+                    if include_thetas:
+                        f.write("frame,fps,time_s,x,y,z,euler_x,euler_y,euler_z,quat_w,quat_x,quat_y,quat_z,thetaR,thetaL\n")
+                        fmt = "{frame},{fps:.6f},{time_s:.6f},{x:.6f},{y:.6f},{z:.6f},{euler_x:.9f},{euler_y:.9f},{euler_z:.9f},{quat_w:.9f},{quat_x:.9f},{quat_y:.9f},{quat_z:.9f},{thetaR:.9f},{thetaL:.9f}\n"
+                    else:
+                        f.write("frame,fps,time_s,x,y,z,euler_x,euler_y,euler_z,quat_w,quat_x,quat_y,quat_z\n")
+                        fmt = "{frame},{fps:.6f},{time_s:.6f},{x:.6f},{y:.6f},{z:.6f},{euler_x:.9f},{euler_y:.9f},{euler_z:.9f},{quat_w:.9f},{quat_x:.9f},{quat_y:.9f},{quat_z:.9f}\n"
                     for r in rows:
-                        f.write("{frame},{fps:.6f},{time_s:.6f},{x:.6f},{y:.6f},{z:.6f},{euler_x:.9f},{euler_y:.9f},{euler_z:.9f},{quat_w:.9f},{quat_x:.9f},{quat_y:.9f},{quat_z:.9f},{thetaR:.9f},{thetaL:.9f}\n".format(**r))
+                        f.write(fmt.format(**r))
             else:
                 out={"meta":{"angle_unit":P.other_angle_unit,"fps":fps,"swap_lr":P.swap_lr,
+                             "wheel_cache": include_thetas,
                              "frame_start":int(scn.frame_start),"frame_end":int(scn.frame_end)},
                      "samples":rows}
                 with open(path,"w",encoding="utf-8") as f: json.dump(out,f,indent=2)
         except Exception as e:
             self.report({'ERROR'}, f"Failed to write: {e}"); return {'CANCELLED'}
-        self.report({'INFO'}, f"Keyframes exported to {path} ({len(rows)} rows)"); return {'FINISHED'}
+        note = "" if include_thetas else " (chassis pose only — Build Cache first for wheel thetas)"
+        self.report({'INFO'}, f"Keyframes exported to {path} ({len(rows)} rows){note}"); return {'FINISHED'}
 
 # ---------------------- UI ----------------------
 class SG_PT_Panel(bpy.types.Panel):
@@ -2501,6 +3481,13 @@ class SG_PT_Panel(bpy.types.Panel):
             r = col.row(); r.enabled = (P.autocorrect_mode == 'LINEAR')
             r.prop(P, "linear_rotation_fraction")
             col.separator()
+            # Heading policies (apply to both S-Ease and Linear).
+            active = P.autocorrect_mode in ('SEASE', 'LINEAR')
+            r = col.row(); r.enabled = active
+            r.prop(P, "intermediate_heading")
+            r = col.row(); r.enabled = active
+            r.prop(P, "reverse_policy")
+            col.separator()
             col.prop(P, "speed_profile")
             r = col.row(); r.enabled = (P.speed_profile == 'CONSTANT')
             r.prop(P, "constant_ramp_frames")
@@ -2556,8 +3543,6 @@ classes=(
     SG_Props,
     SG_OT_ValidateMotion,
     SG_OT_AutocorrectBake,
-    SG_OT_AutocorrectSEase,
-    SG_OT_AutocorrectLinear,
     SG_OT_RevertAutocorrect,
     SG_OT_AttachDrivers,
     SG_OT_BuildCache,
@@ -2576,15 +3561,26 @@ def register():
     bpy.app.driver_namespace['sg_theta'] = sg_theta
     bpy.app.driver_namespace['sg_quat_comp'] = sg_quat_comp
     bpy.app.driver_namespace['sg_quat_comp_obj'] = sg_quat_comp_obj
+    # Rehydrate any cache text datablocks already in the file (drivers
+    # attached in a previous session will start working immediately).
+    if _on_file_load not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(_on_file_load)
+    _load_all_caches_from_texts()
     _register_draw_handler()
     _tag_viewport_redraw()
 
 def unregister():
     _unregister_draw_handler()
+    if _on_file_load in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(_on_file_load)
     for c in reversed(classes):
         bpy.utils.unregister_class(c)
-    for k in ('sg_theta', 'sg_quat_comp', 'sg_quat_comp_obj', _driver_key()):
-        bpy.app.driver_namespace.pop(k, None)
+    dn = bpy.app.driver_namespace
+    for k in ('sg_theta', 'sg_quat_comp', 'sg_quat_comp_obj', _DEFKEY, _LASTKEY):
+        dn.pop(k, None)
+    # Also purge any per-chassis cache entries this session installed.
+    for k in [k for k in list(dn.keys()) if isinstance(k, str) and k.startswith(_DEFKEY_PREFIX)]:
+        dn.pop(k, None)
     del bpy.types.Scene.sg_props
 
 if __name__=="__main__":
