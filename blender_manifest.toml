@@ -7,8 +7,12 @@ tagline = "Chassis motion to per-wheel RPM (2/3/4/6-wheel configs) with CSV expo
 maintainer = "Danyal S."
 type = "add-on"
 
-# Runs on the current 4.2 LTS line and the 5.0 series.
+# Runs on the current 4.2 LTS line and the 5.x series. Cap the max so
+# future Blender-side API breaks surface as install-time warnings rather
+# than silent runtime failures; bump when the addon has been retested
+# against a newer major release.
 blender_version_min = "4.2.0"
+blender_version_max = "6.0.0"
 
 license = ["SPDX:GPL-3.0-or-later"]
 
