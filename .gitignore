@@ -1,0 +1,13 @@
+# Local build/test artifacts
+Addon Test.zip
+*.zip
+
+# Editor/IDE
+.idea/
+.vscode/
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
